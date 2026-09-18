@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#
+# NetworkXternal pre-commit: enforce the house style on staged changes before they land.
+#
+# Each check inspects only the added lines of a staged file, so older code migrates on its own
+# schedule while no new violation sneaks in. Arm these hooks with:
+#
+#   git config core.hooksPath .githooks
+#
+# Bypass knowingly (you almost never should) with: git commit --no-verify
+
+set -u
+LC_ALL=C
+
+failed=0
+
+# Prints the reason and the first offending lines, and marks the commit rejected.
+fail() { # fail <matches> <message-line>...
+    local matches=$1
+    shift
+    local line
+    for line in "$@"; do echo "pre-commit: $line"; done
+    printf '%s\n' "$matches" | head -5
+    failed=1
+}
+
+# The lines a staged file gained, read off the `@@ -a,b +c,d @@` headers of a zero-context diff.
+added_lines() { # added_lines <path>
+    git diff --cached --unified=0 -- "$1" | grep '^+' | grep -v '^+++'
+}
+
+# region Style Checks
+
+# Comment banners and rule lines. A foldable section is `# region <name>` / `# endregion <name>`.
+check_banners() { # check_banners <path> <added>
+    local matches
+    matches=$(printf '%s\n' "$2" | grep -nE '^\+[[:space:]]*#[[:space:]]*([-=*_#]{4,}|.*[-=]{6,})' || true)
+    [ -z "$matches" ] || fail "$matches" \
+        "$1 adds a comment banner or rule line -" \
+        "            use '# region <name>' / '# endregion <name>' for a foldable section."
+}
+
+# Sphinx-only attribute comments. A module or class attribute is documented by the docstring under it.
+check_attribute_comments() { # check_attribute_comments <path> <added>
+    local matches
+    matches=$(printf '%s\n' "$2" | grep -nE '^\+[[:space:]]*#:' || true)
+    [ -z "$matches" ] || fail "$matches" \
+        "$1 documents an attribute with '#:' -" \
+        '            put a """docstring""" on the line after the assignment instead.'
+}
+
+# Commented-out code. A workload or target that should not run is switched off by its `enabled` flag.
+check_commented_code() { # check_commented_code <path> <added>
+    local matches
+    matches=$(printf '%s\n' "$2" | grep -nE '^\+[[:space:]]*#[[:space:]]*(def |class |return |import |from .* import |if .*:|for .*:)' || true)
+    [ -z "$matches" ] || fail "$matches" \
+        "$1 adds commented-out code -" \
+        "            delete it, or switch the behaviour off through configuration."
+}
+
+# Backward-looking comments. Git holds the history; a comment states what the code is now.
+check_history_comments() { # check_history_comments <path> <added>
+    local matches
+    matches=$(printf '%s\n' "$2" | grep -inE '^\+[[:space:]]*#.*\b(previously|used to|no longer|renamed (from|to)|moved from|was formerly)\b' || true)
+    [ -z "$matches" ] || fail "$matches" \
+        "$1 adds a comment about the past -" \
+        "            state what the code does now; the reason belongs in the commit message."
+}
+
+# endregion Style Checks
+
+while IFS= read -r -d '' file; do
+    case "$file" in
+    *.py | *.pyi)
+        added=$(added_lines "$file")
+        check_banners "$file" "$added"
+        check_attribute_comments "$file" "$added"
+        check_commented_code "$file" "$added"
+        check_history_comments "$file" "$added"
+        ;;
+    *.yml | *.yaml | *.toml | *.json)
+        added=$(added_lines "$file")
+        check_banners "$file" "$added"
+        ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+# Formatters and linters, skipped where the tool is not installed.
+if command -v ruff > /dev/null 2>&1; then
+    while IFS= read -r -d '' file; do
+        ruff format --check "$file" > /dev/null 2>&1 ||
+            { echo "pre-commit: $file is not ruff-format clean - run 'ruff format $file'"; failed=1; }
+        ruff check --quiet "$file" > /dev/null 2>&1 ||
+            { echo "pre-commit: $file fails ruff's lints - run 'ruff check --fix $file'"; failed=1; }
+    done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.py')
+fi
+
+if command -v dprint > /dev/null 2>&1; then
+    staged=()
+    while IFS= read -r -d '' file; do staged+=("$file"); done \
+        < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.json' '*.yml' '*.yaml' '*.toml' '*.md')
+    if [ ${#staged[@]} -gt 0 ] && ! dprint check "${staged[@]}" > /dev/null 2>&1; then
+        echo "pre-commit: staged JSON, YAML, TOML or Markdown is not dprint clean - run 'dprint fmt'"
+        failed=1
+    fi
+fi
+
+if [ "$failed" -ne 0 ]; then
+    echo ""
+    echo "Fix the above and commit again. Bypass knowingly with: git commit --no-verify"
+    exit 1
+fi
+exit 0

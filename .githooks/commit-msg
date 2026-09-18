@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# NetworkXternal commit-msg: enforce the commit-message contract.
+#
+#   1. The subject starts with an approved verb prefix - Add / Break / Build / Chore / Docs / Fix /
+#      Improve / Make / Release - followed by a capitalized summary, so the history reads as a
+#      consistent changelog. Merge commits are exempt, since Git writes their subject.
+#   2. No AI-assistant attribution: no bot trailer, no "Generated with", no vendor URL, no robot emoji.
+#      Authorship is the human who committed.
+#
+# Bypass knowingly (you almost never should) with: git commit --no-verify
+
+set -u
+
+payload=$(grep -v '^#' "$1")
+subject=$(printf '%s\n' "$payload" | grep -vE '^[[:space:]]*$' | head -1)
+failed=0
+
+case "$subject" in
+Merge*) ;;
+*)
+    if ! printf '%s\n' "$subject" |
+        grep -qE '^(Add|Break|Chore|Docs|Fix|Improve|Make): [A-Z]'; then
+        echo "commit-msg: the subject must be '<Verb>: <Capitalized summary>' with an approved verb -"
+        echo "            Add Break Chore Docs Fix Improve Make."
+        echo "            Got: ${subject:-<empty>}"
+        failed=1
+    fi
+    ;;
+esac
+
+offenders=$(printf '%s\n' "$payload" | grep -inE \
+    'co-authored-by:.*(\[bot\]|\bbot\b|claude|chatgpt|gpt-[0-9]|openai|copilot|gemini|\bbard\b|cursor|codeium|devin)|generated (with|by).*\b(ai|llm|claude|chatgpt|gpt|copilot|gemini|cursor|anthropic|openai)\b|\b(anthropic|openai)\.com|claude\.ai|chatgpt\.com|claude-session|🤖' || true)
+if [ -n "$offenders" ]; then
+    echo "commit-msg: this message carries AI-assistant attribution - the history stays human-authored."
+    printf '%s\n' "$offenders" | head -8
+    failed=1
+fi
+
+if [ "$failed" -ne 0 ]; then
+    echo ""
+    echo "Fix the subject or the trailer and commit again. Bypass knowingly with: git commit --no-verify"
+    exit 1
+fi
+exit 0
