@@ -1,453 +1,300 @@
-from abc import abstractmethod
-from contextlib import contextmanager
-from typing import Sequence, Optional, Set
-import collections
+"""SQL backend: four tables — vertices, edges indexed by both ends, and one attribute table per store.
+
+Every statement goes through SQLAlchemy Core rather than the ORM, since mapping rows into objects
+costs more than the query itself on graph-shaped workloads. Attribute documents are stored as JSON
+text and merged read-modify-write inside one transaction, which every dialect here supports.
+"""
+
+from __future__ import annotations
+
 import json
+from collections.abc import Iterator, Sequence
+from itertools import batched
 
-import sqlalchemy as sa
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Column, Integer, BigInteger, Float, Boolean
-from sqlalchemy.sql import func
-from sqlalchemy import or_, and_
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Index,
+    MetaData,
+    Table,
+    Text,
+    create_engine,
+    delete,
+    func,
+    insert,
+    or_,
+    select,
+)
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import Engine
+from sqlalchemy.pool import StaticPool
 from sqlalchemy_utils import create_database, database_exists
-from sqlalchemy import text
-from sqlalchemy import Index
 
-from networkxternal.base_api import BaseAPI
-from networkxternal.helpers.node import Node
-from networkxternal.helpers.edge import Edge
-from networkxternal.helpers.graph_degree import GraphDegree
-from networkxternal.helpers.algorithms import is_sequence_of, chunks
+from networkxternal.base_api import (
+    Attributes,
+    AttributeStore,
+    BaseDiGraph,
+    BaseGraph,
+    BaseMultiDiGraph,
+    BaseMultiGraph,
+    Role,
+    Triple,
+)
 
-DeclarativeSQL = declarative_base()
+PARAMETER_CAPS = {"mysql": 65_535, "mariadb": 65_535, "postgresql": 65_535, "sqlite": 32_766}
+"""How many parameters one statement may bind, per dialect, which caps how long an `IN` list may grow."""
 
+metadata = MetaData()
 
-class NodeSQL(DeclarativeSQL, Node):
-    __tablename__ = "main_nodes"
-    _id = Column(BigInteger, primary_key=True)
-    weight = Column(Float)
-    label = Column(Integer)
-    payload_json = Column(sa.Text)
+nodes_table = Table("nodes", metadata, Column("node", BigInteger, primary_key=True))
 
-    def __init__(self, *args, **kwargs):
-        DeclarativeSQL.__init__(self)
-        sub_dict = kwargs.pop("payload", {})
-        if len(sub_dict):
-            self.payload_json = json.dumps(sub_dict)
-        Node.__init__(self, *args, **kwargs)
+edges_table = Table(
+    "edges",
+    metadata,
+    Column("edge", BigInteger, primary_key=True),
+    Column("source", BigInteger, nullable=False),
+    Column("target", BigInteger, nullable=False),
+)
 
+node_attributes_table = Table(
+    "node_attributes",
+    metadata,
+    Column("node", BigInteger, primary_key=True),
+    Column("document", Text, nullable=False),
+)
 
-class EdgeSQL(DeclarativeSQL, Edge):
-    __tablename__ = "main_edges"
-    _id = Column(BigInteger, primary_key=True)
-    first = Column(BigInteger)
-    second = Column(BigInteger)
-    is_directed = Column(Boolean)
-    weight = Column(Float)
-    label = Column(Integer)
-    payload_json = Column(sa.Text)
+edge_attributes_table = Table(
+    "edge_attributes",
+    metadata,
+    Column("edge", BigInteger, primary_key=True),
+    Column("document", Text, nullable=False),
+)
 
-    def __init__(self, *args, **kwargs):
-        DeclarativeSQL.__init__(self)
-        sub_dict = kwargs.pop("payload", {})
-        if len(sub_dict):
-            self.payload_json = json.dumps(sub_dict)
-        Edge.__init__(self, *args, **kwargs)
-
-
-index_first = Index("index_first", EdgeSQL.first, unique=False)
-index_second = Index("index_second", EdgeSQL.second, unique=False)
-index_label = Index("index_label", EdgeSQL.label, unique=False)
-index_directed = Index("index_directed", EdgeSQL.is_directed, unique=False)
+Index("edges_by_source", edges_table.c.source, edges_table.c.target, edges_table.c.edge)
+Index("edges_by_target", edges_table.c.target, edges_table.c.source, edges_table.c.edge)
 
 
-class EdgeNewSQL(DeclarativeSQL, Edge):
-    __tablename__ = "new_edges"
-    _id = Column(BigInteger, primary_key=True)
-    first = Column(BigInteger)
-    second = Column(BigInteger)
-    is_directed = Column(Boolean)
-    weight = Column(Float)
-    label = Column(Integer)
-    payload_json = Column(sa.Text)
+class SQLGraph(BaseGraph):
+    """An undirected simple graph stored in a SQL database, as `networkx.Graph` is in RAM."""
 
-    # TODO: Consider using different Integer types in different SQL DBs.
-    # https://stackoverflow.com/a/60840921/2766161
-    def __init__(self, *args, **kwargs):
-        DeclarativeSQL.__init__(self)
-        sub_dict = kwargs.pop("payload", {})
-        if len(sub_dict):
-            self.payload_json = json.dumps(sub_dict)
-        Edge.__init__(self, *args, **kwargs)
+    PAGE = 10_000
+    """One statement carries this many rows; dialects cap the number of bound parameters well above it."""
 
-
-class BaseSQL(BaseAPI):
-    """
-    A generic SQL-compatible wrapper for Graph-shaped data.
-    It's built on top of SQLAlchemy which supports following engines:
-    *   SQLite,
-    *   PostgreSQL,
-    *   MySQL,
-    *   Oracle,
-    *   MS-SQL,
-    *   Firebird.
-    Other dialects are published as external projects.
-    This wrapper does not only emit the query results,
-    but can export the serialized query itself to be used
-    with other SQL-compatible systems.
-    Docs: https://docs.python.org/3/library/sqlite3.html
-
-    CAUTION:
-    Implementations of analytical queries are suboptimal,
-    as implementing them in SQL dialects is troublesome and
-    often results in excessive memory consumption,
-    when temporary tables are created.
-
-    CAUTION:
-    Queries can be exported without execution with `str(query)`,
-    but if you want to compile them for a specific dialect use following snippet:
-    >>> str(query.statement.compile(dialect=postgresql.dialect()))
-    Source: http://nicolascadou.com/blog/2014/01/printing-actual-sqlalchemy-queries/
-
-    CAUTION:
-    Using ORM can be very costly in some cases. Benchmarking with `pyinstrument`
-    revealed that ORM mapping takes 2x more time than `bulk_save_objects()`
-    in case of in-memory SQLite instance.
-    Replacing it with `bulk_insert_mappings()` reduced import time by 70%!
-    https://docs.sqlalchemy.org/en/13/faq/performance.html#result-fetching-slowness-core
-    """
-
-    __is_concurrent__ = True
-    __max_batch_size__ = 1000000
-    __edge_type__ = EdgeSQL
-    __in_memory__ = False
-
-    def __init__(self, url="sqlite:///:memory:", **kwargs):
-        BaseAPI.__init__(self, **kwargs)
-        # https://stackoverflow.com/a/51184173
+    def __init__(self, url: str = "sqlite:///:memory:") -> None:
+        super().__init__()
         if not database_exists(url):
             create_database(url)
-        self.engine = sa.create_engine(url)
-        DeclarativeSQL.metadata.create_all(self.engine)
-        self.session_maker = sessionmaker(bind=self.engine)
+        shared = url.endswith(":memory:")
+        self.engine: Engine = create_engine(
+            url,
+            poolclass=StaticPool if shared else None,
+            connect_args={"check_same_thread": False} if shared else {},
+        )
+        metadata.create_all(self.engine)
+        self.tune()
 
-    # region Metadata
+    def tune(self) -> None:
+        """Applies the dialect's performance settings; the base dialect needs none."""
 
-    def reduce_nodes(self) -> GraphDegree:
-        result = (0, 0)
-        with self.get_session() as s:
-            result = s.query(
-                func.count(NodeSQL.weight).label("count"),
-                func.sum(NodeSQL.weight).label("sum"),
-            ).first()
+    def _attributes_table(self, store: AttributeStore) -> Table:
+        return node_attributes_table if store is AttributeStore.NODES else edge_attributes_table
 
-        return GraphDegree(*result)
+    def _key_column(self, store: AttributeStore) -> Column:
+        return self._attributes_table(store).c.node if store is AttributeStore.NODES else edge_attributes_table.c.edge
 
-    def reduce_edges(self, u=None, v=None, key=None) -> GraphDegree:
-        result = (0, 0)
-        with self.get_session() as s:
-            q = s.query(
-                func.count(EdgeSQL.weight).label("count"),
-                func.sum(EdgeSQL.weight).label("sum"),
+    def _role_column(self, role: Role) -> Column:
+        return edges_table.c.source if role is Role.SOURCE else edges_table.c.target
+
+    @staticmethod
+    def _ends(source: int, target: int, role: Role) -> tuple[int, ...]:
+        """Which ends of a found edge the lookup was asking about."""
+        if role is Role.SOURCE:
+            return (source,)
+        if role is Role.TARGET:
+            return (target,)
+        return (source,) if source == target else (source, target)
+
+    def _role_clause(self, keys: Sequence[int], role: Role):
+        if role is Role.SOURCE:
+            return edges_table.c.source.in_(keys)
+        if role is Role.TARGET:
+            return edges_table.c.target.in_(keys)
+        return or_(edges_table.c.source.in_(keys), edges_table.c.target.in_(keys))
+
+    def insert_ignore(self, table: Table):
+        """An insert that leaves a row already holding the primary key untouched, in this dialect's spelling."""
+        match self.engine.dialect.name:
+            case "sqlite":
+                return sqlite_insert(table).on_conflict_do_nothing()
+            case "postgresql":
+                return postgres_insert(table).on_conflict_do_nothing()
+            case "mysql" | "mariadb":
+                return mysql_insert(table).prefix_with("IGNORE")
+            case other:
+                raise NotImplementedError(f"No conflict-free insert is spelled out for {other}")
+
+    def key_pages(self, keys: Sequence[int], parameters_per_row: int = 1) -> Iterator[Sequence[int]]:
+        """Splits keys into runs that fit the dialect's cap on bound parameters per statement."""
+        cap = PARAMETER_CAPS.get(self.engine.dialect.name, 32_766) // max(parameters_per_row, 1)
+        yield from batched(keys, min(cap, self.PAGE))
+
+    # region Storage Verbs
+
+    def scan_nodes(self) -> Iterator[int]:
+        with self.engine.connect() as connection:
+            result = connection.execution_options(stream_results=True).execute(
+                select(nodes_table.c.node).order_by(nodes_table.c.node)
             )
-            q = self.filter_edges_members(q, u, v)
-            q = self.filter_edges_label(q, key)
-            result = q.first()
+            for row in result.yield_per(self.PAGE):
+                yield row.node
 
-        return GraphDegree(*result)
+    def has_node(self, node: int) -> bool:
+        with self.engine.connect() as connection:
+            found = connection.execute(select(nodes_table.c.node).where(nodes_table.c.node == node)).first()
+        return found is not None
+
+    def number_of_nodes(self) -> int:
+        with self.engine.connect() as connection:
+            return connection.execute(select(func.count()).select_from(nodes_table)).scalar_one()
+
+    def upsert_nodes(self, nodes: Sequence[int]) -> None:
+        rows = [{"node": int(node)} for node in dict.fromkeys(nodes)]
+        with self.engine.begin() as connection:
+            if rows:
+                connection.execute(self.insert_ignore(nodes_table), rows)
+
+    def drop_nodes(self, nodes: Sequence[int]) -> None:
+        keys = list(nodes)
+        if not keys:
+            return
+        with self.engine.begin() as connection:
+            for page in self.key_pages(keys, parameters_per_row=2):
+                connection.execute(delete(edges_table).where(self._role_clause(page, Role.ANY)))
+            for page in self.key_pages(keys):
+                connection.execute(delete(nodes_table).where(nodes_table.c.node.in_(page)))
+
+    def find_edges(self, nodes: Sequence[int], role: Role) -> list[list[Triple]]:
+        keys = list(nodes)
+        if not keys:
+            return []
+        grouped: dict[int, list[Triple]] = {key: [] for key in keys}
+        with self.engine.connect() as connection:
+            for page in self.key_pages(keys, parameters_per_row=2 if role is Role.ANY else 1):
+                rows = connection.execute(select(edges_table).where(self._role_clause(page, role)))
+                for row in rows:
+                    for end in self._ends(row.source, row.target, role):
+                        if end in grouped:
+                            grouped[end].append((row.source, row.target, row.edge))
+        return [grouped[key] for key in keys]
+
+    def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
+        keys = list(nodes)
+        if not keys:
+            return []
+        counts = dict.fromkeys(keys, 0)
+        ends = [edges_table.c.source, edges_table.c.target] if role is Role.ANY else [self._role_column(role)]
+        with self.engine.connect() as connection:
+            for page in self.key_pages(keys):
+                for column in ends:
+                    counted = (
+                        select(column.label("end"), func.count().label("degree"))
+                        .where(column.in_(page))
+                        .group_by(column)
+                    )
+                    for row in connection.execute(counted):
+                        if row.end in counts:
+                            counts[row.end] += row.degree
+        return [counts[key] for key in keys]
+
+    def upsert_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
+        triples = list(zip(sources, targets, edges, strict=True))
+        if not triples:
+            return
+        rows = [{"edge": int(edge), "source": int(source), "target": int(target)} for source, target, edge in triples]
+        with self.engine.begin() as connection:
+            for page in self.key_pages([row["edge"] for row in rows]):
+                connection.execute(delete(edges_table).where(edges_table.c.edge.in_(page)))
+            connection.execute(insert(edges_table), rows)
+            ends = [{"node": end} for end in {end for row in rows for end in (row["source"], row["target"])}]
+            connection.execute(self.insert_ignore(nodes_table), ends)
+
+    def drop_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
+        keys = list(edges)
+        if not keys:
+            return
+        with self.engine.begin() as connection:
+            for page in self.key_pages(keys):
+                connection.execute(delete(edges_table).where(edges_table.c.edge.in_(page)))
+
+    def count_edges(self) -> int:
+        with self.engine.connect() as connection:
+            return connection.execute(select(func.count()).select_from(edges_table)).scalar_one()
 
     def biggest_edge_id(self) -> int:
-        result = 0
-        with self.get_session() as s:
-            biggest = s.query(
-                func.max(EdgeSQL._id).label("max"),
-            ).first()
-            if biggest[0] is None:
-                result = 0
-            else:
-                result = biggest[0]
-        return result
+        with self.engine.connect() as connection:
+            found = connection.execute(select(func.max(edges_table.c.edge))).scalar()
+        return found or 0
 
-    # region Bulk Reads
+    def read_documents(self, store: AttributeStore, keys: Sequence[int]) -> list[Attributes]:
+        keys = list(keys)
+        if not keys:
+            return []
+        table = self._attributes_table(store)
+        column = self._key_column(store)
+        found: dict[int, Attributes] = {}
+        with self.engine.connect() as connection:
+            for page in self.key_pages(keys):
+                rows = connection.execute(select(column, table.c.document).where(column.in_(page)))
+                found.update({row[0]: json.loads(row.document) for row in rows})
+        return [found.get(key, {}) for key in keys]
 
-    @property
-    def nodes(self) -> Sequence[Node]:
-        with self.get_session() as s:
-            return s.query(NodeSQL).all()
-        return []
+    def merge_documents(self, store: AttributeStore, keys: Sequence[int], entries: Sequence[Attributes]) -> None:
+        keys = list(keys)
+        if not keys:
+            return
+        table = self._attributes_table(store)
+        column = self._key_column(store)
+        stored = self.read_documents(store, keys)
+        merged: dict[int, Attributes] = {}
+        for index, (key, held) in enumerate(zip(keys, stored, strict=True)):
+            entry = entries[0] if len(entries) == 1 else entries[index]
+            merged[int(key)] = {**merged.get(int(key), held), **entry}
+        rows = [{column.name: key, "document": json.dumps(entry)} for key, entry in merged.items()]
+        with self.engine.begin() as connection:
+            for page in self.key_pages(list(merged)):
+                connection.execute(delete(table).where(column.in_(page)))
+            connection.execute(insert(table), rows)
 
-    @property
-    def edges(self) -> Sequence[Edge]:
-        with self.get_session() as s:
-            return s.query(EdgeSQL).all()
-        return []
+    def drop_documents(self, store: AttributeStore, keys: Sequence[int]) -> None:
+        keys = list(keys)
+        if not keys:
+            return
+        table = self._attributes_table(store)
+        with self.engine.begin() as connection:
+            for page in self.key_pages(keys):
+                connection.execute(delete(table).where(self._key_column(store).in_(page)))
 
-    @property
-    def out_edges(self) -> Sequence[Edge]:
-        with self.get_session() as s:
-            return (
-                s.query(EdgeSQL).filter(EdgeSQL.is_directed == True).all()  # noqa: E712
-            )  # noqa: E712
-        return []
+    def clear(self) -> None:
+        with self.engine.begin() as connection:
+            for table in (edge_attributes_table, node_attributes_table, edges_table, nodes_table):
+                connection.execute(delete(table))
+        self.next_edge_id = None
 
-    @property
-    def mentioned_nodes_ids(self) -> Sequence[int]:
-        with self.get_session() as s:
-            all_from = s.query(EdgeSQL.first).distinct().all()
-            all_to = s.query(EdgeSQL.second).distinct().all()
-            result = set(all_from).union(all_to)
-            return result
-        return []
+    def close(self) -> None:
+        self.engine.dispose()
 
-    # region Random Reads
+    # endregion Storage Verbs
 
-    def has_node(self, n) -> Optional[Node]:
-        n = self.make_node_id(n)
-        with self.get_session() as s:
-            return s.query(NodeSQL).filter(NodeSQL._id == n).first()
-        return None
 
-    def has_edge(self, u, v, key=None) -> Sequence[Edge]:
-        with self.get_session() as s:
-            q = s.query(EdgeSQL)
-            q = self.filter_edges_members(q, u, v)
-            q = self.filter_edges_label(q, key)
-            return q.all()
-        return []
+class SQLDiGraph(SQLGraph, BaseDiGraph):
+    """A directed simple graph stored in a SQL database, as `networkx.DiGraph` is in RAM."""
 
-    def neighbors_of_group(self, vs: Sequence[int]) -> Set[int]:
-        result = set()
-        with self.get_session() as s:
-            edges = (
-                s.query(EdgeSQL)
-                .filter(
-                    or_(
-                        EdgeSQL.first.in_(vs),
-                        EdgeSQL.second.in_(vs),
-                    )
-                )
-                .all()
-            )
-            for e in edges:
-                if e.first not in vs:
-                    result.add(e.first)
-                elif e.second not in vs:
-                    result.add(e.second)
-        return result
 
-    # region Random Writes
+class SQLMultiGraph(SQLGraph, BaseMultiGraph):
+    """An undirected multigraph stored in a SQL database, as `networkx.MultiGraph` is in RAM."""
 
-    def add(self, obj, upsert=True) -> int:
-        if isinstance(obj, DeclarativeSQL):
-            with self.get_session() as s:
-                s.merge(obj)
-            return 1
 
-        if not isinstance(obj, collections.Sequence):
-            obj = [obj]
-
-        # We are dealing with a collection of `Node`s or `Edge`s.
-        all_ids = [o._id for o in obj]
-        new_dicts = {o._id: o.__dict__ for o in obj}
-        target_class = EdgeSQL if is_sequence_of(obj, Edge) else NodeSQL
-        with self.get_session() as s:
-            # Only merge those entries which already exist in the database
-            if upsert:
-                for each in (
-                    s.query(target_class).filter(target_class._id.in_(all_ids)).all()
-                ):
-                    new_dict = new_dicts.pop(each._id)
-                    for k, v in new_dict.items():
-                        if k != "_id":
-                            setattr(each, k, v)
-                    s.merge(each)
-            # Only add those posts which did not exist in the database
-            s.bulk_insert_mappings(
-                target_class,
-                new_dicts.values(),
-                return_defaults=False,
-                render_nulls=True,
-            )
-            return len(new_dicts)
-
-        return super().add(obj)
-
-    def remove(self, obj) -> int:
-        with self.get_session() as s:
-            # Edge
-            if isinstance(obj, Edge):
-                if obj._id < 0:
-                    return (
-                        s.query(EdgeSQL)
-                        .filter_by(
-                            first=obj.first,
-                            second=obj.second,
-                            is_directed=obj.is_directed,
-                        )
-                        .delete()
-                    )
-                else:
-                    return s.query(EdgeSQL).filter_by(_id=obj._id).delete()
-            # Node
-            elif isinstance(obj, Node):
-                return (
-                    s.query(EdgeSQL)
-                    .filter(
-                        or_(
-                            EdgeSQL.first == obj._id,
-                            EdgeSQL.second == obj._id,
-                        )
-                    )
-                    .delete()
-                    + s.query(NodeSQL).filter_by(_id=obj._id).delete()
-                )
-
-        return super().remove(obj)
-
-    def remove_node(self, n) -> int:
-        return self.remove(self.make_node(n))
-
-    # region Bulk Writes
-
-    def clear_edges(self) -> int:
-        result = 0
-        with self.get_session() as s:
-            result += s.query(EdgeSQL).delete()
-            result += s.query(EdgeNewSQL).delete()
-        return result
-
-    def clear(self) -> int:
-        result = 0
-        with self.get_session() as s:
-            result += s.query(NodeSQL).delete()
-            result += s.query(EdgeSQL).delete()
-            result += s.query(EdgeNewSQL).delete()
-        return result
-
-    def add_stream(self, stream, upsert=True) -> int:
-        if upsert:
-            return super().add_stream(stream, upsert=True)
-
-        with self.get_session() as s:
-            # Build the new table.
-            chunk_len = type(self).__max_batch_size__
-            for objs in chunks(stream, chunk_len):
-                s.bulk_insert_mappings(
-                    EdgeNewSQL,
-                    [o.__dict__ for o in objs],
-                    return_defaults=False,
-                    render_nulls=True,
-                )
-
-        # Import the new data.
-        cnt = self.number_of_edges()
-        self.insert_table(EdgeNewSQL.__tablename__)
-        self.clear_table(EdgeNewSQL.__tablename__)
-        self.add_missing_nodes()
-        result = self.number_of_edges() - cnt
-        return result
-
-    # region Helpers
-
-    def insert_table(self, source_name: str):
-        with self.get_session() as s:
-            migration = text(
-                f"""
-                INSERT INTO {EdgeSQL.__tablename__}
-                SELECT * FROM {source_name};
-            """
-            )
-            s.execute(migration)
-
-    @abstractmethod
-    def upsert_table(self, source_name: str):
-        with self.get_session() as s:
-            # Performing an `INSERT` and then a `DELETE` might lead to integrity issues,
-            # so perhaps a way to get around it, and to perform everything neatly in
-            # a single statement, is to take advantage of the `[deleted]` temporary table.
-            # migration = text(f'''
-            # DELETE {EdgeNewSQL.__tablename__};
-            # OUTPUT DELETED.*
-            # INTO {EdgeSQL.__tablename__} (_id, first, second, weight, payload_json)
-            # ''')
-            # But this syntax isn't globally supported.
-            migration = text(
-                f"""
-                REPLACE INTO {EdgeSQL.__tablename__}
-                SELECT * FROM {source_name};
-            """
-            )
-            s.execute(migration)
-
-    def clear_table(self, table_name: str):
-        with self.get_session() as s:
-            s.execute(text(f"DELETE FROM {table_name};"))
-
-    @contextmanager
-    def get_session(self):
-        session = self.session_maker()
-        session.expire_on_commit = False
-        try:
-            yield session
-            session.commit()
-        except Exception as e:
-            print(e)
-            session.rollback()
-            raise e
-        finally:
-            session.close()
-
-    def filter_edges_containing(self, q, n):
-        return q.filter(
-            or_(
-                EdgeSQL.first == n,
-                EdgeSQL.second == n,
-            )
-        )
-
-    def filter_edges_members(self, q, u, v):
-        u = self.make_node_id(u)
-        v = self.make_node_id(v)
-        if u < 0 and v < 0:
-            return q
-        elif u < 0 or v < 0:
-            if not self.directed:
-                return self.filter_edges_containing(q, max(u, v))
-            elif u < 0:
-                return q.filter(EdgeSQL.second == v)
-            elif v < 0:
-                return q.filter(EdgeSQL.first == u)
-        else:
-            if self.directed:
-                if u == v:
-                    return self.filter_edges_containing(q, u)
-                else:
-                    return q.filter(
-                        and_(
-                            EdgeSQL.first == u,
-                            EdgeSQL.second == v,
-                        )
-                    )
-            else:
-                if u == v:
-                    return self.filter_edges_containing(q, u)
-                else:
-                    return q.filter(
-                        or_(
-                            and_(
-                                EdgeSQL.first == v,
-                                EdgeSQL.second == u,
-                            ),
-                            and_(
-                                EdgeSQL.first == u,
-                                EdgeSQL.second == v,
-                            ),
-                        )
-                    )
-
-    def filter_edges_label(self, q, key):
-        key = self.make_label(key)
-        if key < 0:
-            return q
-        return q.filter(EdgeSQL.label == key)
+class SQLMultiDiGraph(SQLGraph, BaseMultiDiGraph):
+    """A directed multigraph stored in a SQL database, as `networkx.MultiDiGraph` is in RAM."""

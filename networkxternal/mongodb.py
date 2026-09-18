@@ -1,328 +1,205 @@
-from typing import Optional, Set, Sequence
+"""MongoDB backend: edges as documents indexed by both ends, attributes in two collections beside them.
 
-# Properties of every entry are: 'from_id', 'to_id', 'weight'
-# There are indexes by find keys.
+Vertices live in a collection of their own, so an isolated vertex survives the removal of its last
+edge, and both attribute stores are plain document collections that `$set` merges field by field.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator, Sequence
+from itertools import batched
+from urllib.parse import urlparse
+
 import pymongo
-from pymongo import MongoClient
-from pymongo import UpdateOne
+from pymongo import MongoClient, UpdateOne
 
-from networkxternal.base_api import BaseAPI
-from networkxternal.helpers.edge import Edge
-from networkxternal.helpers.node import Node
-from networkxternal.helpers.graph_degree import GraphDegree
-from networkxternal.helpers.algorithms import is_sequence_of, extract_database_name
+from networkxternal.base_api import (
+    Attributes,
+    AttributeStore,
+    BaseDiGraph,
+    BaseGraph,
+    BaseMultiDiGraph,
+    BaseMultiGraph,
+    Role,
+    Triple,
+)
 
 
-class MongoDB(BaseAPI):
-    """
-    MongoDB until second.6 had 1'000 element limit for the batch size.
-    It was later pushed to 100'000, but there isn't much improvement
-    beyond this point and not every document is small enough to fit
-    in RAM with such batch sizes.
-    https://stackoverflow.com/q/51250036/2766161
-    https://docs.mongodb.com/manual/reference/limits/#Write-Command-Batch-Limit-Size
-    """
+def database_name(url: str, default: str = "graph") -> str:
+    """The database a connection string addresses, or `default` when it names none."""
+    parts = [part for part in urlparse(url).path.split("/") if part]
+    return parts[0].lower() if parts else default
 
-    __max_batch_size__ = 10000
-    __is_concurrent__ = True
-    __edge_type__ = Edge
-    __node_type__ = Node
 
-    def __init__(self, url="mongodb://localhost:27017/graph", **kwargs):
-        BaseAPI.__init__(self, **kwargs)
-        _, db_name = extract_database_name(url)
-        self.db = MongoClient(url)
-        self.edges_collection = self.db[db_name]["edges"]
-        self.nodes_collection = self.db[db_name]["nodes"]
-        self.create_index()
+class MongoGraph(BaseGraph):
+    """An undirected simple graph stored in MongoDB, as `networkx.Graph` is in RAM."""
 
-    # region Metadata
+    PAGE = 10_000
+    """Batch writes beyond this size bring no further throughput and cost a lot of memory on the server."""
 
-    def reduce_nodes(self) -> GraphDegree:
-        result = self.nodes_collection.aggregate(pipeline=[self.pipe_compute_degree()])
-        result = list(result)
-        if len(result) == 0:
-            return GraphDegree(0, 0)
-        return GraphDegree(result[0]["count"], result[0]["weight"])
+    def __init__(self, url: str = "mongodb://localhost:27017/graph") -> None:
+        super().__init__()
+        self.client = MongoClient(url)
+        database = self.client[database_name(url)]
+        self.nodes_collection = database["nodes"]
+        self.edges_collection = database["edges"]
+        self.stores = {
+            AttributeStore.NODES: database["nodes_attributes"],
+            AttributeStore.EDGES: database["edges_attributes"],
+        }
+        self._create_indexes()
 
-    def reduce_edges(self, u=None, v=None, key=None) -> GraphDegree:
-        result = self.edges_collection.aggregate(
-            pipeline=[
-                step
-                for step in [
-                    self.pipe_match_edge_members(u, v),
-                    self.pipe_match_label(key),
-                    self.pipe_compute_degree(),
-                ]
-                if step
+    def _create_indexes(self) -> None:
+        """Compound indexes, so an adjacency read is answered from the index without touching a document."""
+        self.edges_collection.create_index([("source", 1), ("target", 1)])
+        self.edges_collection.create_index([("target", 1), ("source", 1)])
+
+    @staticmethod
+    def _ends(source: int, target: int, role: Role) -> tuple[int, ...]:
+        """Which ends of a found edge the lookup was asking about."""
+        if role is Role.SOURCE:
+            return (source,)
+        if role is Role.TARGET:
+            return (target,)
+        return (source,) if source == target else (source, target)
+
+    def _role_filter(self, keys: Sequence[int], role: Role) -> dict:
+        if role is Role.SOURCE:
+            return {"source": {"$in": list(keys)}}
+        if role is Role.TARGET:
+            return {"target": {"$in": list(keys)}}
+        return {"$or": [{"source": {"$in": list(keys)}}, {"target": {"$in": list(keys)}}]}
+
+    # region Storage Verbs
+
+    def scan_nodes(self) -> Iterator[int]:
+        after: int | None = None
+        while True:
+            wanted = {} if after is None else {"_id": {"$gt": after}}
+            page = list(self.nodes_collection.find(wanted, {"_id": 1}).sort("_id", pymongo.ASCENDING).limit(self.PAGE))
+            for document in page:
+                yield document["_id"]
+            if len(page) < self.PAGE:
+                return
+            after = page[-1]["_id"]
+
+    def has_node(self, node: int) -> bool:
+        return self.nodes_collection.find_one({"_id": node}, {"_id": 1}) is not None
+
+    def number_of_nodes(self) -> int:
+        return self.nodes_collection.count_documents({})
+
+    def upsert_nodes(self, nodes: Sequence[int]) -> None:
+        if not len(nodes):
+            return
+        writes = [UpdateOne({"_id": node}, {"$setOnInsert": {"_id": node}}, upsert=True) for node in nodes]
+        self.nodes_collection.bulk_write(writes, ordered=False)
+
+    def drop_nodes(self, nodes: Sequence[int]) -> None:
+        if not len(nodes):
+            return
+        self.edges_collection.delete_many(self._role_filter(nodes, Role.ANY))
+        self.nodes_collection.delete_many({"_id": {"$in": list(nodes)}})
+
+    def find_edges(self, nodes: Sequence[int], role: Role) -> list[list[Triple]]:
+        keys = list(nodes)
+        if not keys:
+            return []
+        grouped: dict[int, list[Triple]] = {key: [] for key in keys}
+        found = self.edges_collection.find(self._role_filter(keys, role), {"source": 1, "target": 1})
+        for document in found:
+            source, target = document["source"], document["target"]
+            for end in self._ends(source, target, role):
+                if end in grouped:
+                    grouped[end].append((source, target, document["_id"]))
+        return [grouped[key] for key in keys]
+
+    def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
+        keys = list(nodes)
+        if not keys:
+            return []
+        counts = dict.fromkeys(keys, 0)
+        fields = ("source", "target") if role is Role.ANY else (role.value,)
+        for field in fields:
+            pipeline = [
+                {"$match": {field: {"$in": keys}}},
+                {"$group": {"_id": f"${field}", "count": {"$sum": 1}}},
             ]
-        )
-        result = list(result)
-        if len(result) == 0:
-            return GraphDegree(0, 0)
-        return GraphDegree(result[0]["count"], result[0]["weight"])
+            for entry in self.edges_collection.aggregate(pipeline, allowDiskUse=True):
+                if entry["_id"] in counts:
+                    counts[entry["_id"]] += entry["count"]
+        return [counts[key] for key in keys]
+
+    def upsert_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
+        if not len(sources):
+            return
+        triples = list(zip(sources, targets, edges, strict=True))
+        writes = [
+            UpdateOne({"_id": edge}, {"$set": {"source": source, "target": target}}, upsert=True)
+            for source, target, edge in triples
+        ]
+        self.edges_collection.bulk_write(writes, ordered=False)
+        self.upsert_nodes(list({end for source, target, _ in triples for end in (source, target)}))
+
+    def drop_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
+        if len(edges):
+            self.edges_collection.delete_many({"_id": {"$in": list(edges)}})
+
+    def count_edges(self) -> int:
+        return self.edges_collection.count_documents({})
 
     def biggest_edge_id(self) -> int:
-        result = self.edges_collection.find(
-            {},
-            sort=[("_id", pymongo.DESCENDING)],
-        ).limit(1)
-        result = list(result)
-        if len(result) == 0:
-            return 0
-        return int(result[0]["_id"])
+        found = self.edges_collection.find({}, {"_id": 1}).sort("_id", pymongo.DESCENDING).limit(1)
+        return next((document["_id"] for document in found), 0)
 
-    # region Bulk Reads
+    def read_documents(self, store: AttributeStore, keys: Sequence[int]) -> list[Attributes]:
+        keys = list(keys)
+        if not keys:
+            return []
+        found = {document.pop("_id"): document for document in self.stores[store].find({"_id": {"$in": keys}})}
+        return [found.get(key, {}) for key in keys]
 
-    @property
-    def nodes(self) -> Sequence[Node]:
-        return [Node(**as_dict) for as_dict in self.nodes_collection.find()]
+    def merge_documents(self, store: AttributeStore, keys: Sequence[int], entries: Sequence[Attributes]) -> None:
+        keys = list(keys)
+        if not keys:
+            return
+        for entry in entries:
+            for name in entry:
+                if name.startswith("$") or "." in name:
+                    raise ValueError(f"MongoDB reads {name!r} as a path or an operator, not as a field name")
+        shared = entries[0] if len(entries) == 1 else None
+        writes = [
+            UpdateOne({"_id": key}, {"$set": shared if shared is not None else entries[index]}, upsert=True)
+            for index, key in enumerate(keys)
+        ]
+        for page in batched(writes, self.PAGE):
+            self.stores[store].bulk_write(list(page), ordered=False)
 
-    @property
-    def edges(self) -> Sequence[Edge]:
-        return [Edge(**as_dict) for as_dict in self.edges_collection.find()]
+    def drop_documents(self, store: AttributeStore, keys: Sequence[int]) -> None:
+        if len(keys):
+            self.stores[store].delete_many({"_id": {"$in": list(keys)}})
 
-    @property
-    def out_edges(self) -> Sequence[Edge]:
-        result = self.edges_collection.find(
-            filter={
-                "is_directed": True,
-            }
-        )
-        return [Edge(**as_dict) for as_dict in result]
-
-    @property
-    def mentioned_nodes_ids(self) -> Sequence[int]:
-        ids = set()
-        # Calling `.distinct('first')` on the query object fails,
-        # as the result BSON will be beyond 16 MB.
-        for doc in self.edges_collection.find({}, {"_id": 0, "first": 1}):
-            ids.add(doc["first"])
-        for doc in self.edges_collection.find({}, {"_id": 0, "second": 1}):
-            ids.add(doc["second"])
-        return ids
-
-    # region Random Reads
-
-    def has_node(self, n) -> Optional[Node]:
-        n = self.make_node_id(n)
-        result = self.nodes_collection.find_one(
-            filter={
-                "_id": n,
-            }
-        )
-        if result:
-            return Node(**result)
-        return None
-
-    def has_edge(self, u, v, key=None) -> Sequence[Edge]:
-        result = self.edges_collection.aggregate(
-            pipeline=[
-                step
-                for step in [
-                    self.pipe_match_edge_members(u, v),
-                    self.pipe_match_label(key),
-                ]
-                if step
-            ]
-        )
-        return [Edge(**as_dict) for as_dict in result]
-
-    def neighbors_of_group(self, vs: Sequence[int]) -> Set[int]:
-        vs_set = set(vs)
-        vs = list(vs_set)
-        result = self.edges_collection.find(
-            filter={
-                "$or": [
-                    {
-                        "first": {"$in": vs},
-                    },
-                    {
-                        "second": {"$in": vs},
-                    },
-                ],
-            },
-            projection={
-                "first": 1,
-                "second": 1,
-            },
-        )
-        es = [Edge(**as_dict) for as_dict in result]
-        vs_unique = self.unique_members_of_edges(es)
-        return vs_unique.difference(vs_set)
-
-    # region Random Writes
-
-    def add(self, obj, upsert=True) -> int:
-        is_edge = isinstance(obj, Edge)
-        is_node = isinstance(obj, Node)
-        is_edges = is_sequence_of(obj, Edge)
-        is_nodes = is_sequence_of(obj, Node)
-        target = (
-            self.edges_collection if (is_edge or is_edges) else self.nodes_collection
-        )
-
-        # A single `Edge` or `Node`
-        if is_edge or is_node:
-            if upsert:
-                return (
-                    target.update_one(
-                        filter={
-                            "_id": obj._id,
-                        },
-                        update={
-                            "$set": obj.__dict__,
-                        },
-                        upsert=True,
-                    ).modified_count
-                    >= 1
-                )
-            else:
-                return target.insert_one(obj.__dict__).acknowledged
-
-        # Many objects.
-        elif is_edges or is_nodes:
-            if upsert:
-
-                def make_upsert(o):
-                    return UpdateOne(
-                        filter={
-                            "_id": o._id,
-                        },
-                        update={
-                            "$set": o.__dict__,
-                        },
-                        upsert=True,
-                    )
-
-                ops = list(map(make_upsert, obj))
-                try:
-                    result = target.bulk_write(requests=ops, ordered=False)
-                    cnt_old = result.bulk_api_result["nUpserted"]
-                    cnt_new = result.bulk_api_result["nInserted"]
-                    return cnt_new + cnt_old
-                except pymongo.errors.BulkWriteError as bwe:
-                    print(bwe)
-                    print(bwe.details["writeErrors"])
-                    return 0
-            else:
-                obj = [o.__dict__ for o in obj]
-                result = target.insert_many(obj, ordered=False)
-                return len(result.inserted_ids)
-
-        return super().add(obj, upsert=upsert)
-
-    def remove(self, obj) -> int:
-        is_edge = isinstance(obj, Edge)
-        is_node = isinstance(obj, Node)
-        is_edges = is_sequence_of(obj, Edge)
-        is_nodes = is_sequence_of(obj, Node)
-        if not (is_edge or is_node or is_edges or is_nodes):
-            return super().remove(obj)
-
-        target = (
-            self.edges_collection if (is_edge or is_edges) else self.nodes_collection
-        )
-
-        # A single `Edge` or `Node`
-        if is_edge or is_node:
-            return (
-                target.delete_one(
-                    filter={
-                        "_id": obj._id,
-                    }
-                ).deleted_count
-                >= 1
-            )
-
-        # Many objects.
-        else:
-            ids = list([o._id for o in obj])
-            return target.delete_many(
-                filter={
-                    "_id": {"$in": ids},
-                }
-            ).deleted_count
-
-    def remove_node(self, n) -> int:
-        self.remove(self.make_node(n))
-        result = self.edges_collection.delete_many(
-            filter={
-                "$or": [
-                    {"first": n},
-                    {"second": n},
-                ]
-            }
-        )
-        return result.deleted_count
-
-    # region Bulk Writes
-
-    def clear_edges(self):
-        self.edges_collection.drop()
-
-    def clear(self):
+    def clear(self) -> None:
         self.edges_collection.drop()
         self.nodes_collection.drop()
+        for collection in self.stores.values():
+            collection.drop()
+        self._create_indexes()
+        self.next_edge_id = None
 
-    # region Helpers
+    def close(self) -> None:
+        self.client.close()
 
-    def create_index(self, background=False):
-        self.edges_collection.create_index("first", background=background, sparse=True)
-        self.edges_collection.create_index("second", background=background, sparse=True)
-        self.edges_collection.create_index(
-            "is_directed", background=background, sparse=True
-        )
+    # endregion Storage Verbs
 
-    def pipe_compute_degree(self) -> dict:
-        return {
-            "$group": {
-                "_id": None,
-                "count": {"$sum": 1},
-                "weight": {"$sum": "$weight"},
-            }
-        }
 
-    def pipe_match_edge_containing(self, n) -> dict:
-        return {
-            "$match": {
-                "$or": [{"first": n}, {"second": n}],
-            }
-        }
+class MongoDiGraph(MongoGraph, BaseDiGraph):
+    """A directed simple graph stored in MongoDB, as `networkx.DiGraph` is in RAM."""
 
-    def pipe_match_edge_members(self, u, v) -> dict:
-        u = self.make_node_id(u)
-        v = self.make_node_id(v)
-        if u < 0 and v < 0:
-            return None
-        elif u < 0 or v < 0:
-            if not self.directed:
-                return self.pipe_match_edge_containing(max(u, v))
-            elif u < 0:
-                return {"$match": {"second": v}}
-            elif v < 0:
-                return {"$match": {"first": u}}
-        else:
-            if self.directed:
-                if u == v:
-                    return self.pipe_match_edge_containing(u)
-                else:
-                    return {"$match": {"first": u, "second": v}}
-            else:
-                if u == v:
-                    return self.pipe_match_edge_containing(u)
-                else:
-                    return {
-                        "$match": {
-                            "$or": [
-                                {"first": u, "second": v},
-                                {"first": v, "second": u},
-                            ]
-                        }
-                    }
 
-    def pipe_match_label(self, key):
-        key = self.make_label(key)
-        if key < 0:
-            return None
-        return {"$match": {"label": key}}
+class MongoMultiGraph(MongoGraph, BaseMultiGraph):
+    """An undirected multigraph stored in MongoDB, as `networkx.MultiGraph` is in RAM."""
+
+
+class MongoMultiDiGraph(MongoGraph, BaseMultiDiGraph):
+    """A directed multigraph stored in MongoDB, as `networkx.MultiDiGraph` is in RAM."""
