@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import tracemalloc
 from pathlib import Path
 from time import perf_counter
 
@@ -85,20 +86,31 @@ def measure(target: Target, dataset: Dataset, workloads: list[Workload], samples
     measurements: list[Measurement] = []
     with target.open(dataset.name) as graph:
         graph.clear()
+        tracemalloc.start()
         imported, seconds = load(graph, dataset)
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
         measurements.append(
-            Measurement(target.name, dataset.name, "Import: Edge List", Phase.IMPORT, imported, seconds)
+            Measurement(target.name, dataset.name, "Import: Edge List", Phase.IMPORT, imported, seconds, peak)
         )
         sample = sample_of(dataset, samples)
         for workload in workloads:
-            started = perf_counter()
-            operations = workload.run(graph, sample)
+            operations, seconds, peak = timed(workload, graph, sample)
             measurements.append(
-                Measurement(
-                    target.name, dataset.name, workload.name, workload.phase, operations, perf_counter() - started
-                )
+                Measurement(target.name, dataset.name, workload.name, workload.phase, operations, seconds, peak)
             )
     return measurements
+
+
+def timed(workload: Workload, graph: BaseGraph, sample: list[tuple[int, int, float | None]]) -> tuple[int, float, int]:
+    """Runs one workload, answering how many operations it did, how long it took, and its allocation peak."""
+    tracemalloc.start()
+    started = perf_counter()
+    operations = workload.run(graph, sample)
+    seconds = perf_counter() - started
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    return operations, seconds, peak
 
 
 def main() -> None:

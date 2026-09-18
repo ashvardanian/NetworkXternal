@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -29,6 +30,9 @@ class Measurement:
     seconds: float
     """How long they took, wall-clock."""
 
+    peak_bytes: int = 0
+    """The high-water mark of Python allocation during the run, which is what a view holds."""
+
     @property
     def rate(self) -> float:
         """Operations per second, or zero where nothing was measured."""
@@ -36,22 +40,26 @@ class Measurement:
 
 
 def as_markdown(measurements: list[Measurement]) -> str:
-    """A table per dataset, workloads down the side and stores across the top, in operations per second."""
+    """One table per dataset of operations per second, and one of the peak bytes each workload held."""
     lines: list[str] = []
     for dataset in dict.fromkeys(entry.dataset for entry in measurements):
         rows = [entry for entry in measurements if entry.dataset == dataset]
-        targets = list(dict.fromkeys(entry.target for entry in rows))
-        lines.append(f"### {dataset}\n")
-        lines.append("| Workload | " + " | ".join(targets) + " |")
-        lines.append("| :--- | " + " | ".join("---:" for _ in targets) + " |")
-        for workload in dict.fromkeys(entry.workload for entry in rows):
-            cells = []
-            for target in targets:
-                found = next((e for e in rows if e.workload == workload and e.target == target), None)
-                cells.append(f"{found.rate:,.0f}" if found else "—")
-            lines.append(f"| {workload} | " + " | ".join(cells) + " |")
-        lines.append("")
+        lines.append(f"### {dataset}, operations per second\n")
+        lines.extend(table_of(rows, lambda entry: f"{entry.rate:,.0f}"))
+        lines.append(f"### {dataset}, peak bytes held\n")
+        lines.extend(table_of(rows, lambda entry: f"{entry.peak_bytes:,.0f}"))
     return "\n".join(lines)
+
+
+def table_of(rows: list[Measurement], cell: Callable[[Measurement], str]) -> list[str]:
+    """One table of the given rows, workloads down the side and stores across the top."""
+    targets = list(dict.fromkeys(entry.target for entry in rows))
+    lines = ["| Workload | " + " | ".join(targets) + " |", "| :--- | " + " | ".join("---:" for _ in targets) + " |"]
+    for workload in dict.fromkeys(entry.workload for entry in rows):
+        found = {entry.target: entry for entry in rows if entry.workload == workload}
+        lines.append(f"| {workload} | " + " | ".join(cell(found[t]) if t in found else "—" for t in targets) + " |")
+    lines.append("")
+    return lines
 
 
 def write_json(measurements: list[Measurement], path: Path) -> None:
