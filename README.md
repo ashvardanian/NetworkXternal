@@ -51,18 +51,18 @@ All four NetworkX shapes come with each: `Graph`, `DiGraph`, `MultiGraph` and `M
 
 ## External-Memory Algorithms
 
-Vanilla NetworkX walks one vertex at a time, which costs one round-trip per step against a store.
-The algorithms in `networkxternal.algorithms` expand a whole frontier per call instead, so a traversal costs a round-trip per level rather than per vertex, and they hold vertex state only — never the adjacency of the graph.
+Vanilla NetworkX walks one vertex at a time, which costs a round-trip per step against a store, and pulls a whole neighbourhood to take one of them.
+The algorithms in `networkxternal.algorithms` stream edges instead: vertex state lives in arrays, edges arrive in stored order a page at a time, and one hub vertex no longer decides the footprint.
 
-| Function                       | What It Holds                            | What It Costs                                      |
-| :----------------------------- | :--------------------------------------- | :------------------------------------------------- |
-| `breadth_first_layers`         | The frontier and the visited set         | One round-trip per level                           |
-| `shortest_path_lengths`        | One depth per reached vertex             | One round-trip per level                           |
-| `connected_components`         | One label per vertex                     | One sweep per round-trip page, until labels settle |
-| `pagerank`                     | Two floats per vertex                    | One sweep per round-trip page, weights optional    |
-| `core_numbers`                 | One degree per vertex                    | The neighbourhood of a peeled vertex only          |
-| `triangle_counts`              | The neighbourhood of the wanted vertices | One page of lookups per intersection round         |
-| `sample_nodes`, `sample_edges` | The reservoir                            | One pass, nothing else buffered                    |
+| Function                       | What It Holds                                | What It Costs                                                                                          |
+| :----------------------------- | :------------------------------------------- | :----------------------------------------------------------------------------------------------------- |
+| `breadth_first_layers`         | The frontier and the visited set             | A round-trip per level, switching to a full edge scan once the frontier passes a tenth of the vertices |
+| `shortest_path_lengths`        | One depth per reached vertex                 | As above, one layer at a time                                                                          |
+| `connected_components`         | Three 8-byte slots per vertex                | One edge pass, union-find, no sweep that can fail to settle                                            |
+| `pagerank`                     | Three `array("d")` vectors and a dense index | One scatter pass per sweep, plus one weight pass in total                                              |
+| `core_numbers`                 | One degree per vertex, as `array("q")`       | One edge pass per peeling round, never a peeled vertex's neighbourhood                                 |
+| `triangle_counts`              | A CSR-style adjacency of the wanted vertices | Two edge passes to pack it, then sorted-run intersections through memoryviews                          |
+| `sample_nodes`, `sample_edges` | The reservoir                                | One pass, nothing else buffered                                                                        |
 
 Everything else NetworkX ships still applies where the graph fits, and `__networkx_backend__` is declared for the dispatch protocol NetworkX 3.x uses.
 
