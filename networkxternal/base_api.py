@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from enum import StrEnum
 from itertools import batched, islice
+from threading import Lock
 from typing import Any, ClassVar
 
 type Attributes = dict[str, Any]
@@ -202,6 +203,8 @@ class BaseGraph(ABC):
     def __init__(self) -> None:
         self.next_edge_id: int | None = None
         self.graph: dict[str, Any] = {}
+        self.edge_ids_lock = Lock()
+        """Guards the identifier counter, which several threads sharing one instance would otherwise race."""
 
     @property
     def name(self) -> str:
@@ -403,11 +406,15 @@ class BaseGraph(ABC):
         return [triple for _, triple in self.find_pairs([source], [target])]
 
     def allocate_edge_ids(self, count: int) -> list[int]:
-        """Hands out identifiers past every one the graph already holds."""
-        if self.next_edge_id is None:
-            self.next_edge_id = max(self.biggest_edge_id() + 1, FIRST_EDGE_ID)
-        first = self.next_edge_id
-        self.next_edge_id += count
+        """Hands out identifiers past every one the graph already holds, to one thread at a time.
+
+        The lock covers the threads sharing this instance; two processes still need a durable claim.
+        """
+        with self.edge_ids_lock:
+            if self.next_edge_id is None:
+                self.next_edge_id = max(self.biggest_edge_id() + 1, FIRST_EDGE_ID)
+            first = self.next_edge_id
+            self.next_edge_id += count
         return list(range(first, first + count))
 
     def add_edges_from_arrays(
