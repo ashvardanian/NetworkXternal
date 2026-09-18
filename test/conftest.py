@@ -29,6 +29,7 @@ EDGES = [
 BACKENDS = {
     "sqlite": ("networkxternal.sqlite", "SQLite", "sqlite:///{directory}/{shape}.db3"),
     "ustore": ("networkxternal.ustore", "UStore", "{directory}/{shape}"),
+    "ustore-ram": ("networkxternal.ustore", "UStore", ":memory:"),
     "mongodb": ("networkxternal.mongodb", "Mongo", "mongodb://localhost:27017/test_{shape}"),
     "clickhouse": ("networkxternal.clickhouse", "ClickHouse", "clickhouse://graph:graph@localhost:8123/test_{shape}"),
     "postgres": ("networkxternal.postgres", "Postgres", "postgresql+psycopg://graph:graph@localhost:5432/test_{shape}"),

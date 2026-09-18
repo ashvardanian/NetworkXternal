@@ -2,6 +2,12 @@
 
 UStore is the only store here that speaks graphs natively, so a lookup of many vertices costs one
 call rather than one query per vertex, and attribute documents are merged in place by the engine.
+
+Two choices decide what the numbers mean. Persistence is made here: a directory opens a database on
+disk, and `IN_MEMORY` opens one that never touches it. The storage engine behind either is chosen
+when the extension is linked, one per build, and `engines()` answers which one this build carries —
+rebuild with `CMAKE_ARGS="-DUSTORE_USE_ROCKSDB=ON -DUSTORE_PYTHON_ENGINE=rocksdb" pip install .`
+for a log-structured engine instead of the in-memory default.
 """
 
 from __future__ import annotations
@@ -28,6 +34,16 @@ from networkxternal.base_api import (
 
 type View = Database | Transaction
 
+IN_MEMORY = ":memory:"
+"""The directory that opens a database holding everything in RAM, as SQLite spells the same choice."""
+
+
+def engines() -> tuple[str, ...]:
+    """The storage engines the installed extension was linked with, such as `ram` or `rocksdb`."""
+    from ustore.lib import engines_compiled
+
+    return tuple(engines_compiled())
+
 
 class UStoreGraph(BaseGraph):
     """An undirected simple graph stored in UStore, as `networkx.Graph` is in RAM."""
@@ -46,15 +62,16 @@ class UStoreGraph(BaseGraph):
     ) -> None:
         """Opens a graph in the collection `graph`, with vertex and edge attributes beside it.
 
-        Either a directory `url` to open a `Database` in, or an already open `view` to borrow.
+        Either a directory `url` to open a `Database` in, `IN_MEMORY` for one that never reaches disk,
+        or an already open `view` to borrow.
         """
         super().__init__()
         if (url is None) == (view is None):
-            raise ValueError("Pass either a directory to open or an open view to borrow")
-        if url is not None:
+            raise ValueError("Pass either a directory to open, `IN_MEMORY`, or an open view to borrow")
+        if view is None and url != IN_MEMORY:
             # The engine opens a directory rather than creating one, so an empty graph starts here.
             Path(url).mkdir(parents=True, exist_ok=True)
-        self.view = view if view is not None else Database(url)
+        self.view = view if view is not None else Database(None if url == IN_MEMORY else url)
         self.graph_collection = self._collection(graph)
         self.nodes_collection = self._collection(nodes)
         self.edges_collection = self._collection(edges)

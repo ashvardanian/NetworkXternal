@@ -69,7 +69,8 @@ TARGETS = (
     ),
     Target("Neo4J", "networkxternal.neo4j", "Neo4JGraph", "bolt://localhost:7687/{dataset}", "URI_NEO4J"),
     Target("Memgraph", "networkxternal.memgraph", "MemgraphGraph", "bolt://localhost:7688/{dataset}", "URI_MEMGRAPH"),
-    Target("UStore", "networkxternal.ustore", "UStoreGraph", "tmp/ustore/{dataset}", "URI_USTORE"),
+    Target("UStore on Disk", "networkxternal.ustore", "UStoreGraph", "tmp/ustore/{dataset}", "URI_USTORE"),
+    Target("UStore in RAM", "networkxternal.ustore", "UStoreGraph", ":memory:", "URI_USTORE_RAM"),
 )
 """Every store a run can touch; `NETWORKXTERNAL_TARGETS` narrows it to a comma-separated subset."""
 
