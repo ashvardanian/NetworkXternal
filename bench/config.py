@@ -57,9 +57,8 @@ TARGETS = (
         "MySQL",
         "networkxternal.mysql",
         "MySQLGraph",
-        "mysql://graph:graph@localhost:3306/{dataset}",
+        "mysql://root:graph@127.0.0.1:3306/{dataset}",
         "URI_MYSQL",
-        enabled=False,
     ),
     Target(
         "ClickHouse",
@@ -70,7 +69,7 @@ TARGETS = (
     ),
     Target("Neo4J", "networkxternal.neo4j", "Neo4JGraph", "bolt://localhost:7687/{dataset}", "URI_NEO4J"),
     Target("Memgraph", "networkxternal.memgraph", "MemgraphGraph", "bolt://localhost:7688/{dataset}", "URI_MEMGRAPH"),
-    Target("UStore", "networkxternal.ustore", "UStoreGraph", "tmp/ustore/{dataset}", "URI_USTORE", enabled=False),
+    Target("UStore", "networkxternal.ustore", "UStoreGraph", "tmp/ustore/{dataset}", "URI_USTORE"),
 )
 """Every store a run can touch; `NETWORKXTERNAL_TARGETS` narrows it to a comma-separated subset."""
 

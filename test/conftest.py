@@ -28,11 +28,13 @@ EDGES = [
 
 BACKENDS = {
     "sqlite": ("networkxternal.sqlite", "SQLite", "sqlite:///{directory}/{shape}.db3"),
+    "ustore": ("networkxternal.ustore", "UStore", "{directory}/{shape}"),
     "mongodb": ("networkxternal.mongodb", "Mongo", "mongodb://localhost:27017/test_{shape}"),
     "clickhouse": ("networkxternal.clickhouse", "ClickHouse", "clickhouse://graph:graph@localhost:8123/test_{shape}"),
     "postgres": ("networkxternal.postgres", "Postgres", "postgresql+psycopg://graph:graph@localhost:5432/test_{shape}"),
     "neo4j": ("networkxternal.neo4j", "Neo4J", "bolt://localhost:7687/test{shape}"),
     "memgraph": ("networkxternal.memgraph", "Memgraph", "bolt://localhost:7688/test{shape}"),
+    "mysql": ("networkxternal.mysql", "MySQL", "mysql://root:graph@127.0.0.1:3306/test_{shape}"),
 }
 """Where each backend's graph classes live and how a test addresses one of its graphs."""
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Sequence
 from itertools import islice
+from pathlib import Path
 from typing import Any
 
 from ustore.keys import scan_keys
@@ -50,6 +51,9 @@ class UStoreGraph(BaseGraph):
         super().__init__()
         if (url is None) == (view is None):
             raise ValueError("Pass either a directory to open or an open view to borrow")
+        if url is not None:
+            # The engine opens a directory rather than creating one, so an empty graph starts here.
+            Path(url).mkdir(parents=True, exist_ok=True)
         self.view = view if view is not None else Database(url)
         self.graph_collection = self._collection(graph)
         self.nodes_collection = self._collection(nodes)
