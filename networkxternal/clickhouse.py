@@ -68,7 +68,7 @@ class ClickHouseGraph(BaseGraph):
     PAGE = 1 << 20
     """A column store punishes small inserts with too many parts, so pages here are far larger than a row store's."""
 
-    def __init__(self, url: str = "clickhouse://default@localhost:8123/graph") -> None:
+    def __init__(self, url: str = "clickhouse://graph:graph@localhost:8123/graph") -> None:
         super().__init__()
         address = urlparse(url)
         database = address.path.strip("/") or "graph"
@@ -78,7 +78,9 @@ class ClickHouseGraph(BaseGraph):
             username=address.username or "default",
             password=address.password or "",
         )
-        self.client.command(f"CREATE DATABASE IF NOT EXISTS {database}")
+        if not database.replace("-", "_").isidentifier():
+            raise ValueError(f"A database name must be a plain identifier, got {database!r}")
+        self.client.command(f"CREATE DATABASE IF NOT EXISTS `{database}`")
         self.client.database = database
         for statement in SCHEMA:
             self.client.command(statement)
