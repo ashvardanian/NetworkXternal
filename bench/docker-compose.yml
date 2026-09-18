@@ -1,0 +1,80 @@
+# Every server is capped well below what the host has, so a benchmark never starves the machine it
+# shares. Start one at a time by profile: `docker compose --profile mongodb up -d`.
+name: networkxternal
+
+services:
+  mongodb:
+    image: mongo:8
+    profiles: [mongodb, all]
+    ports: ["27017:27017"]
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 2
+    command: ["--wiredTigerCacheSizeGB", "0.5"]
+    tmpfs: ["/data/db:size=2g"]
+
+  postgres:
+    image: postgres:18
+    profiles: [postgres, all]
+    ports: ["5432:5432"]
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 2
+    environment:
+      POSTGRES_USER: graph
+      POSTGRES_PASSWORD: graph
+      POSTGRES_DB: graph
+    # Postgres 18 places its data in a subdirectory, so the mount sits one level above it.
+    tmpfs: ["/var/lib/postgresql:size=2g"]
+
+  mysql:
+    image: mysql:9
+    profiles: [mysql, all]
+    ports: ["3306:3306"]
+    mem_limit: 1g
+    memswap_limit: 1g
+    cpus: 2
+    environment:
+      MYSQL_ROOT_PASSWORD: graph
+      MYSQL_USER: graph
+      MYSQL_PASSWORD: graph
+      MYSQL_DATABASE: graph
+    tmpfs: ["/var/lib/mysql:size=2g"]
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    profiles: [clickhouse, all]
+    ports: ["8123:8123"]
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    environment:
+      CLICKHOUSE_USER: graph
+      CLICKHOUSE_PASSWORD: graph
+    tmpfs: ["/var/lib/clickhouse:size=2g"]
+
+  # The JVM sizes its heap from what the host reports, not from the cgroup, so both are set here.
+  neo4j:
+    image: neo4j:2025-community
+    profiles: [neo4j, all]
+    ports: ["7687:7687", "7474:7474"]
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2
+    environment:
+      NEO4J_AUTH: none
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512M
+    tmpfs: ["/data:size=2g"]
+
+  # Bolt on 7688, so Memgraph and Neo4J can be up at once and measured against each other.
+  memgraph:
+    image: memgraph/memgraph:latest
+    profiles: [memgraph, all]
+    ports: ["7688:7687"]
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2
+    command: ["--memory-limit=1500", "--telemetry-enabled=false"]
