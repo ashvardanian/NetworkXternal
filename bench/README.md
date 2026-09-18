@@ -24,12 +24,12 @@ Under a memory cap that matters: a server that would otherwise swap is killed in
 
 ## What Is Measured
 
-| Phase | Workloads |
-| :--- | :--- |
-| Import | Bulk edge-list load, in pages sized by the backend |
-| Reads | Edge lookup, adjacency of a vertex, neighbours, degree |
+| Phase     | Workloads                                                                     |
+| :-------- | :---------------------------------------------------------------------------- |
+| Import    | Bulk edge-list load, in pages sized by the backend                            |
+| Reads     | Edge lookup, adjacency of a vertex, neighbours, degree                        |
 | Analytics | Neighbours of neighbours, breadth-first traversal to depth 3, PageRank sweeps |
-| Writes | Single-edge upsert, batched upsert, single-edge removal |
+| Writes    | Single-edge upsert, batched upsert, single-edge removal                       |
 
 Workloads are entries in `workloads.py`, selected by `--only` and `--skip` and switched off with the `enabled` flag.
 Stores are entries in `config.py`, selected by `--targets` and pointed elsewhere by the environment variable each one names.
@@ -37,4 +37,4 @@ Stores are entries in `config.py`, selected by `--targets` and pointed elsewhere
 ## Datasets
 
 Small graphs are generated from a seeded Pareto draw, so degrees are as uneven as a real social graph's and no fixture file ships in the repository.
-Large graphs live on the shared filesystem and reach a run through a `data/<name>` symlink, as [data/README.md](../data/README.md) describes.
+Large graphs live on the shared filesystem and reach a run through a `data/<name>` symlink, as the [dataset notes](https://github.com/ashvardanian/NetworkXternal/blob/main/data/README.md) describe.

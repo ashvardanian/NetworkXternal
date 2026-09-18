@@ -11,5 +11,5 @@
     "https://plugins.dprint.dev/g-plane/pretty_yaml-v0.6.0.wasm"
   ],
   "json": { "associations": ["**/*.{json,jsonc}"] },
-  "markdown": { "textWrap": "never" }
+  "markdown": { "textWrap": "maintain", "emphasisKind": "underscores", "strongKind": "underscores" }
 }

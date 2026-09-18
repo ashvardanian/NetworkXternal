@@ -15,8 +15,10 @@ dist/
 # Datasets are symlinks into the shared filesystem, never copies in the repository
 data/*
 !data/.gitkeep
+!data/README.md
 
 # Local databases and benchmark output
+tmp/
 *.db3
 *.sqlite3
 bench/results/

@@ -11,35 +11,35 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [
-    { name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com" },
+  { name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com" },
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Intended Audience :: Information Technology",
-    "Natural Language :: English",
-    "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
-    "Programming Language :: Python :: Free Threading :: 2 - Beta",
-    "Programming Language :: Python :: Implementation :: CPython",
-    "Topic :: Database",
-    "Topic :: Database :: Database Engines/Servers",
-    "Topic :: Scientific/Engineering :: Information Analysis",
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "Natural Language :: English",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Free Threading :: 2 - Beta",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Database",
+  "Topic :: Database :: Database Engines/Servers",
+  "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 dependencies = []
 
 # A backend pulls in its own driver and nothing else, so one missing server never blocks the rest.
 [project.optional-dependencies]
 all = [
-    "clickhouse-connect>=1.8",
-    "neo4j>=6",
-    "networkx>=3.6",
-    "psycopg[binary]>=3.3",
-    "pymongo>=4.18",
-    "sqlalchemy-utils>=0.42",
-    "sqlalchemy>=2.0.54",
+  "clickhouse-connect>=1.8",
+  "neo4j>=6",
+  "networkx>=3.6",
+  "psycopg[binary]>=3.3",
+  "pymongo>=4.18",
+  "sqlalchemy-utils>=0.42",
+  "sqlalchemy>=2.0.54",
 ]
 clickhouse = ["clickhouse-connect>=1.8"]
 mongodb = ["pymongo>=4.18"]
@@ -47,9 +47,9 @@ mysql = ["mysqlclient>=2.3", "sqlalchemy-utils>=0.42", "sqlalchemy>=2.0.54"]
 neo4j = ["neo4j>=6"]
 networkx = ["networkx>=3.6"]
 postgres = [
-    "psycopg[binary]>=3.3",
-    "sqlalchemy-utils>=0.42",
-    "sqlalchemy>=2.0.54",
+  "psycopg[binary]>=3.3",
+  "sqlalchemy-utils>=0.42",
+  "sqlalchemy>=2.0.54",
 ]
 sqlite = ["sqlalchemy-utils>=0.42", "sqlalchemy>=2.0.54"]
 # UStore 1.0 is not on PyPI yet, so its backend installs from the engine's own tree:
@@ -74,7 +74,7 @@ packages = ["networkxternal"]
 addopts = ["-ra", "--showlocals", "--strict-config", "--strict-markers"]
 filterwarnings = ["error"]
 markers = [
-    "server: needs a database server, started from benchmarks/docker-compose.yml",
+  "server: needs a database server, started from benchmarks/docker-compose.yml",
 ]
 minversion = "8.0"
 python_files = ["*.py"]
