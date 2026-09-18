@@ -8,6 +8,7 @@ in one server. Labels cannot be bound as parameters, so the name is quoted once 
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+from itertools import batched
 from urllib.parse import urlparse
 
 from neo4j import GraphDatabase
@@ -19,6 +20,7 @@ from networkxternal.base_api import (
     BaseGraph,
     BaseMultiDiGraph,
     BaseMultiGraph,
+    Cursor,
     Role,
     Triple,
 )
@@ -95,20 +97,66 @@ class Neo4JGraph(BaseGraph):
         with self.driver.session() as session:
             session.run(f"UNWIND $keys AS key MATCH (v:{self.vertex} {{id: key}}) DETACH DELETE v", keys=list(nodes))
 
-    def find_edges(self, nodes: Sequence[int], role: Role) -> list[list[Triple]]:
-        keys = list(nodes)
-        if not keys:
-            return []
+    def scan_edges(self, after: Cursor = None, limit: int | None = None) -> Iterator[Triple]:
+        """Walks the relationships in identifier order, one page per query, resumed by the last identifier."""
+        remaining = limit
+        cursor = after
+        while remaining is None or remaining > 0:
+            width = self.PAGE if remaining is None else min(self.PAGE, remaining)
+            beyond = "" if cursor is None else "WHERE e.id > $after"
+            query = f"""
+            MATCH (source:{self.vertex})-[e:{self.edge}]->(target:{self.vertex}) {beyond}
+            RETURN source.id AS source, target.id AS target, e.id AS edge ORDER BY e.id LIMIT $width
+            """
+            with self.driver.session() as session:
+                page = [
+                    (record["source"], record["target"], record["edge"])
+                    for record in session.run(query, after=None if cursor is None else cursor[2], width=width)
+                ]
+            yield from page
+            if len(page) < width:
+                return
+            cursor = page[-1]
+            if remaining is not None:
+                remaining -= len(page)
+
+    def adjacent_edges(self, nodes: Sequence[int], role: Role) -> Iterator[tuple[int, Triple]]:
+        keys = list(dict.fromkeys(int(node) for node in nodes))
         query = f"""
         UNWIND $keys AS key
         MATCH {self._pattern(role)}
         RETURN key AS key, startNode(e).id AS source, endNode(e).id AS target, e.id AS edge
         """
-        grouped: dict[int, list[Triple]] = {key: [] for key in keys}
-        with self.driver.session() as session:
-            for record in session.run(query, keys=keys):
-                grouped[record["key"]].append((record["source"], record["target"], record["edge"]))
-        return [grouped[key] for key in keys]
+        for page in batched(keys, self.PAGE):
+            with self.driver.session() as session:
+                found = [
+                    (record["key"], (record["source"], record["target"], record["edge"]))
+                    for record in session.run(query, keys=list(page))
+                ]
+            # An undirected match reaches a self-loop from both of its ends.
+            yield from dict.fromkeys(found)
+
+    def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
+        pairs = [[int(source), int(target)] for source, target in zip(sources, targets, strict=True)]
+        if not pairs:
+            return
+        arrow = "->" if self.DIRECTED else "-"
+        query = f"""
+        UNWIND range(0, size($pairs) - 1) AS position
+        MATCH (a:{self.vertex} {{id: $pairs[position][0]}})-[e:{self.edge}]{arrow}(b:{self.vertex})
+        WHERE b.id = $pairs[position][1]
+        RETURN position AS position, startNode(e).id AS source, endNode(e).id AS target, e.id AS edge
+        """
+        for page in batched(enumerate(pairs), self.PAGE):
+            with self.driver.session() as session:
+                found = [
+                    (record["position"], (record["source"], record["target"], record["edge"]))
+                    for record in session.run(query, pairs=[pair for _, pair in page])
+                ]
+            offset = page[0][0]
+            # A self-loop matches in both directions, so the same edge is reported once per position.
+            for position, triple in dict.fromkeys(found):
+                yield offset + position, triple
 
     def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
         keys = list(nodes)

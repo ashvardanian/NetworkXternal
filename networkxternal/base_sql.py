@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Sequence
 from itertools import batched
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
@@ -22,8 +23,10 @@ from sqlalchemy import (
     delete,
     func,
     insert,
+    literal,
     or_,
     select,
+    tuple_,
 )
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as postgres_insert
@@ -39,6 +42,7 @@ from networkxternal.base_api import (
     BaseGraph,
     BaseMultiDiGraph,
     BaseMultiGraph,
+    Cursor,
     Role,
     Triple,
 )
@@ -135,7 +139,7 @@ class SQLGraph(BaseGraph):
             case other:
                 raise NotImplementedError(f"No conflict-free insert is spelled out for {other}")
 
-    def key_pages(self, keys: Sequence[int], parameters_per_row: int = 1) -> Iterator[Sequence[int]]:
+    def key_pages(self, keys: Sequence[Any], parameters_per_row: int = 1) -> Iterator[Sequence[Any]]:
         """Splits keys into runs that fit the dialect's cap on bound parameters per statement."""
         cap = PARAMETER_CAPS.get(self.engine.dialect.name, 32_766) // max(parameters_per_row, 1)
         yield from batched(keys, min(cap, self.PAGE))
@@ -175,19 +179,69 @@ class SQLGraph(BaseGraph):
             for page in self.key_pages(keys):
                 connection.execute(delete(nodes_table).where(nodes_table.c.node.in_(page)))
 
-    def find_edges(self, nodes: Sequence[int], role: Role) -> list[list[Triple]]:
-        keys = list(nodes)
-        if not keys:
-            return []
-        grouped: dict[int, list[Triple]] = {key: [] for key in keys}
+    def scan_edges(self, after: Cursor = None, limit: int | None = None) -> Iterator[Triple]:
+        remaining = limit
+        cursor = after
+        while remaining is None or remaining > 0:
+            width = self.PAGE if remaining is None else min(self.PAGE, remaining)
+            rows = self._edge_page(None, Role.ANY, cursor, width)
+            yield from rows
+            if len(rows) < width:
+                return
+            cursor = rows[-1]
+            if remaining is not None:
+                remaining -= len(rows)
+
+    def adjacent_edges(self, nodes: Sequence[int], role: Role) -> Iterator[tuple[int, Triple]]:
+        keys = list(dict.fromkeys(int(node) for node in nodes))
+        for page in self.key_pages(keys, parameters_per_row=2 if role is Role.ANY else 1):
+            wanted = set(page)
+            cursor: Cursor = None
+            while True:
+                rows = self._edge_page(page, role, cursor, self.PAGE)
+                for source, target, edge in rows:
+                    for end in self._ends(source, target, role):
+                        if end in wanted:
+                            yield end, (source, target, edge)
+                if len(rows) < self.PAGE:
+                    break
+                cursor = rows[-1]
+
+    def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
+        positions: dict[tuple[int, int], list[int]] = {}
+        for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
+            positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
+        if not positions:
+            return
+        per_row = 2 if self.DIRECTED else 4
         with self.engine.connect() as connection:
-            for page in self.key_pages(keys, parameters_per_row=2 if role is Role.ANY else 1):
-                rows = connection.execute(select(edges_table).where(self._role_clause(page, role)))
+            for page in self.key_pages(list(positions), parameters_per_row=per_row):
+                rows = connection.execute(select(edges_table).where(self._pair_clause(page))).all()
                 for row in rows:
-                    for end in self._ends(row.source, row.target, role):
-                        if end in grouped:
-                            grouped[end].append((row.source, row.target, row.edge))
-        return [grouped[key] for key in keys]
+                    for position in positions[self.canonical_pair(row.source, row.target)]:
+                        yield position, (row.source, row.target, row.edge)
+
+    def _pair_clause(self, pairs: Sequence[tuple[int, int]]):
+        """Matches the given pairs, in either orientation while the graph is undirected."""
+        columns = tuple_(edges_table.c.source, edges_table.c.target)
+        asked = columns.in_(list(pairs))
+        if self.DIRECTED:
+            return asked
+        return or_(asked, columns.in_([(target, source) for source, target in pairs]))
+
+    def _edge_page(self, nodes: Sequence[int] | None, role: Role, after: Cursor, width: int) -> list[Triple]:
+        """One page of edges in key order, resumed after `after`, read and handed back without a live cursor.
+
+        Keyset order, so a page stays correct while the caller deletes what an earlier page reported.
+        """
+        key = (edges_table.c.source, edges_table.c.target, edges_table.c.edge)
+        statement = select(*key).order_by(*key).limit(width)
+        if nodes is not None:
+            statement = statement.where(self._role_clause(nodes, role))
+        if after is not None:
+            statement = statement.where(tuple_(*key) > tuple_(*(literal(part) for part in after)))
+        with self.engine.connect() as connection:
+            return [(row.source, row.target, row.edge) for row in connection.execute(statement)]
 
     def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
         keys = list(nodes)

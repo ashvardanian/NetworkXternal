@@ -5,12 +5,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from enum import StrEnum
-from itertools import batched
+from itertools import batched, islice
 from typing import Any, ClassVar
 
 type Attributes = dict[str, Any]
 type Triple = tuple[int, int, int]
 type NodeBunch = int | Iterable[int] | None
+type Cursor = Triple | None
 
 FIRST_EDGE_ID = 1
 """The edge identifier a graph starts handing out from."""
@@ -144,17 +145,18 @@ class DegreeView:
             counts = self.graph.degrees(nodes, self.role)
             yield from ((node, count or 0) for node, count in zip(nodes, counts, strict=True))
             return
-        found = self.graph.find_edges(nodes, self.role)
-        identifiers = [edge for triples in found for _, _, edge in triples]
-        attributes = self.graph.read_documents(AttributeStore.EDGES, identifiers)
-        held = iter(attributes)
-        for node, triples in zip(nodes, found, strict=True):
-            total: float = 0
-            for source, target, _ in triples:
-                weight = next(held).get(self.weight, 1)
-                # NetworkX counts an undirected self-loop at both of its ends.
-                total += weight * 2 if source == target and self.role is Role.ANY else weight
-            yield node, total
+        totals = dict.fromkeys(nodes, 0.0)
+        for page in batched(self.graph.adjacent_edges(nodes, self.role), self.graph.PAGE):
+            self._add_weights(totals, page)
+        yield from ((node, totals[node]) for node in nodes)
+
+    def _add_weights(self, totals: dict[int, float], page: Sequence[tuple[int, Triple]]) -> None:
+        """Adds one page of incident edges to the running totals, reading their documents in one call."""
+        attributes = self.graph.read_documents(AttributeStore.EDGES, [edge for _, (_, _, edge) in page])
+        for (node, (source, target, _)), found in zip(page, attributes, strict=True):
+            weight = found.get(self.weight, 1)
+            # NetworkX counts an undirected self-loop at both of its ends.
+            totals[node] += weight * 2 if source == target and self.role is Role.ANY else weight
 
 
 class BaseGraph(ABC):
@@ -221,8 +223,27 @@ class BaseGraph(ABC):
         """Removes vertices together with every edge they take part in, but not their attributes."""
 
     @abstractmethod
-    def find_edges(self, nodes: Sequence[int], role: Role) -> list[list[Triple]]:
-        """The (source, target, edge) triples every vertex takes part in, one list per given vertex."""
+    def scan_edges(self, after: Cursor = None, limit: int | None = None) -> Iterator[Triple]:
+        """Every edge of the graph in stored order, streamed, resuming after the edge `after` names.
+
+        A backend holds one page of rows at a time, whatever the degree of any vertex in it.
+        """
+
+    @abstractmethod
+    def adjacent_edges(self, nodes: Sequence[int], role: Role) -> Iterator[tuple[int, Triple]]:
+        """Every edge incident to a given vertex in that role, streamed as `(vertex, edge)` pairs.
+
+        An edge joining two of `nodes` is reported once per vertex; a self-loop is reported once.
+        The stream is bounded by a page of rows, so a vertex of any degree is never materialized.
+        """
+
+    @abstractmethod
+    def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
+        """Every edge stored between a given pair, streamed as `(position, edge)` in the pairs' own order.
+
+        A pair holding no edge yields nothing; a pair given twice yields its edges twice.
+        An undirected graph answers a pair in either orientation, a directed one only as asked.
+        """
 
     @abstractmethod
     def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
@@ -324,9 +345,8 @@ class BaseGraph(ABC):
     def remove_nodes_from(self, nodes: Iterable[int]) -> None:
         """Removes vertices with every edge they take part in and the attributes of both."""
         for page in batched(nodes, self.PAGE):
-            found = self.find_edges(page, Role.ANY)
-            identifiers = [edge for triples in found for _, _, edge in triples]
-            self.drop_documents(AttributeStore.EDGES, identifiers)
+            for incident in batched(self.adjacent_edges(page, Role.ANY), self.PAGE):
+                self.drop_documents(AttributeStore.EDGES, [edge for _, (_, _, edge) in incident])
             self.drop_nodes(page)
             self.drop_documents(AttributeStore.NODES, page)
 
@@ -343,18 +363,16 @@ class BaseGraph(ABC):
         """The pair both orientations of an undirected edge share."""
         return (source, target) if self.DIRECTED else (min(source, target), max(source, target))
 
-    def stored_between(self, sources: Sequence[int]) -> dict[tuple[int, int], list[Triple]]:
-        """Every stored edge leaving `sources`, grouped by canonical pair, in stored order."""
-        unique = list(dict.fromkeys(sources))
-        found = self.find_edges(unique, self.outgoing_role)
-        grouped: dict[tuple[int, int], list[Triple]] = {}
-        for triples in found:
-            for triple in triples:
-                entries = grouped.setdefault(self.canonical_pair(triple[0], triple[1]), [])
-                # A self-loop of an undirected graph is found once leaving and once entering.
-                if triple not in entries:
-                    entries.append(triple)
+    def edges_of_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> list[list[Triple]]:
+        """The edges between each pair, one list per pair, holding no more than the batch asked about."""
+        grouped: list[list[Triple]] = [[] for _ in sources]
+        for position, triple in self.find_pairs(sources, targets):
+            grouped[position].append(triple)
         return grouped
+
+    def edges_of_pair(self, source: int, target: int) -> list[Triple]:
+        """The edges between one pair, which is bounded by the multiplicity of that pair alone."""
+        return [triple for _, triple in self.find_pairs([source], [target])]
 
     def allocate_edge_ids(self, count: int) -> list[int]:
         """Hands out identifiers past every one the graph already holds."""
@@ -396,12 +414,12 @@ class BaseGraph(ABC):
             self.next_edge_id = max([self.next_edge_id or 0, *(key + 1 for key in wanted if key is not None)])
             upserted = list(zip(sources, targets, identifiers, strict=True))
         else:
-            stored = self.stored_between(sources)
+            stored = self.edges_of_pairs(sources, targets)
             pending: dict[tuple[int, int], int] = {}
-            for source, target in zip(sources, targets, strict=True):
+            for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
                 pair = self.canonical_pair(source, target)
-                if pair in stored:
-                    identifiers.append(stored[pair][0][2])
+                if stored[position]:
+                    identifiers.append(stored[position][0][2])
                     continue
                 if pair not in pending:
                     pending[pair] = self.allocate_edge_ids(1)[0]
@@ -475,13 +493,11 @@ class BaseGraph(ABC):
         sources = [int(source) for source in sources]
         targets = [int(target) for target in targets]
         wanted = [None] * len(sources) if keys is None else [None if key is None else int(key) for key in keys]
-        stored = self.stored_between(sources)
+        stored = self.edges_of_pairs(sources, targets)
         removed: list[Triple] = []
         taken: set[Triple] = set()
-        for source, target, key in zip(sources, targets, wanted, strict=True):
-            remaining = [
-                triple for triple in stored.get(self.canonical_pair(source, target), []) if triple not in taken
-            ]
+        for position, key in enumerate(wanted):
+            remaining = [triple for triple in stored[position] if triple not in taken]
             if not self.MULTIGRAPH:
                 removed.extend(remaining)
             elif key is not None:
@@ -509,34 +525,28 @@ class BaseGraph(ABC):
     def edge_triples(self, nbunch: NodeBunch) -> Iterator[Triple]:
         """Every edge once, as stored for the whole graph and oriented away from `nbunch` otherwise."""
         if nbunch is None:
-            for page in batched(self, self.PAGE):
-                for triples in self.find_edges(page, Role.SOURCE):
-                    yield from triples
+            yield from self.scan_edges()
             return
-        nodes = nbunch if isinstance(nbunch, Iterable) else [nbunch]
-        seen: set[Triple] = set()
-        for page in batched(nodes, self.PAGE):
-            found = self.find_edges(page, self.outgoing_role)
-            for node, triples in zip(page, found, strict=True):
-                for source, target, edge in triples:
-                    oriented = (source, target, edge) if source == node else (target, source, edge)
-                    identity = (*self.canonical_pair(source, target), edge)
-                    if identity not in seen:
-                        seen.add(identity)
-                        yield oriented
+        nodes = list(nbunch) if isinstance(nbunch, Iterable) else [nbunch]
+        wanted = set(nodes)
+        for node, (source, target, edge) in self.adjacent_edges(nodes, self.outgoing_role):
+            other = target if source == node else source
+            # An edge joining two vertices of the bunch is reported by the lower of them alone.
+            if not self.DIRECTED and other in wanted and other < node:
+                continue
+            yield (source, target, edge) if source == node else (target, source, edge)
 
     @property
     def edges(self) -> EdgeView:
         return EdgeView(self)
 
     def has_edge(self, source: int, target: int, key: int | None = None) -> bool:
-        between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
-        return any(key is None or edge == key for _, _, edge in between)
+        return any(key is None or edge == key for _, _, edge in self.edges_of_pair(source, target))
 
     def number_of_edges(self, source: int | None = None, target: int | None = None) -> int:
         if source is None or target is None:
             return self.count_edges()
-        return len(self.stored_between([source]).get(self.canonical_pair(source, target), []))
+        return len(self.edges_of_pair(source, target))
 
     def size(self, weight: str | None = None) -> int | float:
         if weight is None:
@@ -582,7 +592,7 @@ class BaseGraph(ABC):
         return {target for _, target, _ in self.edge_triples(given)} - given
 
     def get_edge_data(self, source: int, target: int, default: Any = None) -> Any:
-        between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
+        between = self.edges_of_pair(source, target)
         if not between:
             return default
         return self.read_documents(AttributeStore.EDGES, [between[0][2]])[0]
@@ -593,12 +603,10 @@ class BaseGraph(ABC):
 
     def clear_edges(self) -> None:
         """Removes every edge and its attributes, keeping the vertices."""
-        for page in batched(self, self.PAGE):
-            stored = [triple for triples in self.find_edges(page, Role.SOURCE) for triple in triples]
-            if stored:
-                sources, targets, identifiers = zip(*stored, strict=True)
-                self.drop_edges(sources, targets, identifiers)
-                self.drop_documents(AttributeStore.EDGES, identifiers)
+        while page := list(islice(self.scan_edges(), self.PAGE)):
+            sources, targets, identifiers = zip(*page, strict=True)
+            self.drop_edges(sources, targets, identifiers)
+            self.drop_documents(AttributeStore.EDGES, identifiers)
         self.next_edge_id = None
 
     # endregion Edges
@@ -628,7 +636,7 @@ class BaseGraph(ABC):
         """The identifier an edge label addresses."""
         if self.MULTIGRAPH:
             return label[2]
-        between = self.stored_between([label[0]]).get(self.canonical_pair(label[0], label[1]), [])
+        between = self.edges_of_pair(label[0], label[1])
         if not between:
             raise KeyError(label)
         return between[0][2]
@@ -685,8 +693,7 @@ class BaseDiGraph(BaseGraph):
         return {node: {source: {} for source in self.predecessors(node)} for node in self}
 
     def predecessors(self, node: int) -> Iterator[int]:
-        found = self.find_edges([node], Role.TARGET)
-        return iter(sorted({source for source, _, _ in found[0]}))
+        return iter(sorted({source for _, (source, _, _) in self.adjacent_edges([node], Role.TARGET)}))
 
     @property
     def in_degree(self) -> DegreeView:
@@ -712,7 +719,7 @@ class BaseMultiGraph(BaseGraph):
             raise NetworkXternalError(f"The graph holds no edge {key} between {source} and {target}")
 
     def get_edge_data(self, source: int, target: int, key: int | None = None, default: Any = None) -> Any:
-        between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
+        between = self.edges_of_pair(source, target)
         identifiers = [edge for _, _, edge in between if key is None or edge == key]
         if not identifiers:
             return default

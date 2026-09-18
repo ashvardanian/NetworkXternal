@@ -1,8 +1,8 @@
 """Semi-external graph algorithms: vertex state stays in RAM, adjacency is pulled from the store page by page.
 
 NetworkX walks one vertex at a time, which costs one round-trip per step against an external store.
-Every traversal here expands a whole frontier in one `find_edges` call instead, so a run costs a
-round-trip per level rather than per vertex, and holds at most a frontier and one value per vertex.
+Every traversal here streams the edges incident to a whole frontier instead, so a run costs a
+round-trip per page of edges rather than per vertex, and holds vertex state and one page of rows.
 """
 
 from __future__ import annotations
@@ -14,35 +14,27 @@ from itertools import batched
 from networkxternal.base_api import AttributeStore, BaseGraph, DegreeView, Role
 
 
-def adjacency_pages(graph: BaseGraph, nodes: Iterable[int], role: Role) -> Iterator[tuple[int, list[tuple[int, int]]]]:
-    """Yields every vertex of `nodes` with the `(neighbour, edge)` pairs its edges reach, one page at a time."""
-    for page in batched(nodes, graph.PAGE):
-        found = graph.find_edges(page, role)
-        for node, triples in zip(page, found, strict=True):
-            yield node, [(target if source == node else source, edge) for source, target, edge in triples]
+def adjacency(graph: BaseGraph, nodes: Iterable[int], role: Role) -> Iterator[tuple[int, int, int]]:
+    """Yields `(vertex, neighbour, edge)` for every edge incident to `nodes`, one page of rows at a time."""
+    for node, (source, target, edge) in graph.adjacent_edges(list(nodes), role):
+        yield node, (target if source == node else source), edge
 
 
-def weighted_adjacency_pages(
+def weighted_adjacency(
     graph: BaseGraph, nodes: Iterable[int], role: Role, weight: str | None
-) -> Iterator[tuple[int, list[tuple[int, float]]]]:
-    """Yields every vertex with the `(neighbour, weight)` pairs its edges reach, one page of reads per page.
+) -> Iterator[tuple[int, int, float]]:
+    """Yields `(vertex, neighbour, weight)` for every incident edge, reading one page of documents at a time.
 
     With `weight` unset every edge counts as one, and no attribute document is read at all.
     """
-    for page in batched(nodes, graph.PAGE):
-        found = graph.find_edges(page, role)
+    for page in batched(graph.adjacent_edges(list(nodes), role), graph.PAGE):
         if weight is None:
-            for node, triples in zip(page, found, strict=True):
-                yield node, [(target if source == node else source, 1.0) for source, target, _ in triples]
+            for node, (source, target, _) in page:
+                yield node, (target if source == node else source), 1.0
             continue
-        identifiers = [edge for triples in found for _, _, edge in triples]
-        attributes = iter(graph.read_documents(AttributeStore.EDGES, identifiers))
-        for node, triples in zip(page, found, strict=True):
-            reached = [
-                (target if source == node else source, float(next(attributes).get(weight, 1)))
-                for source, target, _ in triples
-            ]
-            yield node, reached
+        attributes = graph.read_documents(AttributeStore.EDGES, [edge for _, (_, _, edge) in page])
+        for (node, (source, target, _)), found in zip(page, attributes, strict=True):
+            yield node, (target if source == node else source), float(found.get(weight, 1))
 
 
 def breadth_first_layers(
@@ -62,9 +54,9 @@ def breadth_first_layers(
         depth += 1
         if cutoff is not None and depth > cutoff:
             return
-        reached: set[int] = set()
-        for _, neighbours in adjacency_pages(graph, frontier, graph.outgoing_role):
-            reached.update(neighbour for neighbour, _ in neighbours if neighbour not in visited)
+        reached = {
+            neighbour for _, neighbour, _ in adjacency(graph, frontier, graph.outgoing_role) if neighbour not in visited
+        }
         visited |= reached
         frontier = reached
 
@@ -101,12 +93,9 @@ def connected_components(graph: BaseGraph, iterations: int = 1024) -> dict[int, 
     nodes = list(labels)
     for _ in range(iterations):
         changed = False
-        for node, neighbours in adjacency_pages(graph, nodes, Role.ANY):
-            smallest = min(
-                (labels[neighbour] for neighbour, _ in neighbours if neighbour in labels), default=labels[node]
-            )
-            if smallest < labels[node]:
-                labels[node] = smallest
+        for node, neighbour, _ in adjacency(graph, nodes, Role.ANY):
+            if neighbour in labels and labels[neighbour] < labels[node]:
+                labels[node] = labels[neighbour]
                 changed = True
         if not changed:
             return labels
@@ -133,15 +122,13 @@ def pagerank(
     nodes = list(ranks)
     for _ in range(iterations):
         pushed = dict.fromkeys(ranks, 0.0)
-        dangling = 0.0
-        for node, neighbours in weighted_adjacency_pages(graph, nodes, graph.outgoing_role, weight):
-            total = sum(held for _, held in neighbours)
-            if not total:
-                dangling += ranks[node]
-                continue
-            for neighbour, held in neighbours:
-                if neighbour in pushed:
-                    pushed[neighbour] += ranks[node] * held / total
+        totals = dict.fromkeys(ranks, 0.0)
+        for node, _, held in weighted_adjacency(graph, nodes, graph.outgoing_role, weight):
+            totals[node] += held
+        dangling = sum(ranks[node] for node, total in totals.items() if not total)
+        for node, neighbour, held in weighted_adjacency(graph, nodes, graph.outgoing_role, weight):
+            if totals[node] and neighbour in pushed:
+                pushed[neighbour] += ranks[node] * held / totals[node]
         leaked = damping * dangling * share + (1.0 - damping) * share
         updated = {node: damping * mass + leaked for node, mass in pushed.items()}
         drift = sum(abs(updated[node] - ranks[node]) for node in ranks)
@@ -165,10 +152,9 @@ def core_numbers(graph: BaseGraph) -> dict[int, int]:
         for node in peeled:
             cores[node] = level
             del remaining[node]
-        for _, neighbours in adjacency_pages(graph, peeled, Role.ANY):
-            for neighbour, _ in neighbours:
-                if neighbour in remaining:
-                    remaining[neighbour] -= 1
+        for _, neighbour, _ in adjacency(graph, peeled, Role.ANY):
+            if neighbour in remaining:
+                remaining[neighbour] -= 1
     return cores
 
 
@@ -178,14 +164,17 @@ def triangle_counts(graph: BaseGraph, nodes: Iterable[int] | None = None) -> dic
     Holds the neighbourhood of the wanted vertices and of the vertices one step away from them.
     """
     wanted = set(graph.scan_nodes()) if nodes is None else set(nodes)
-    neighbourhoods = {
-        node: {neighbour for neighbour, _ in neighbours} - {node}
-        for node, neighbours in adjacency_pages(graph, wanted, Role.ANY)
-    }
+    neighbourhoods: dict[int, set[int]] = {node: set() for node in wanted}
+    for node, neighbour, _ in adjacency(graph, list(wanted), Role.ANY):
+        if neighbour != node:
+            neighbourhoods[node].add(neighbour)
     reached = {neighbour for neighbours in neighbourhoods.values() for neighbour in neighbours}
     missing = [neighbour for neighbour in reached if neighbour not in neighbourhoods]
-    for node, neighbours in adjacency_pages(graph, missing, Role.ANY):
-        neighbourhoods[node] = {neighbour for neighbour, _ in neighbours} - {node}
+    for node in missing:
+        neighbourhoods[node] = set()
+    for node, neighbour, _ in adjacency(graph, missing, Role.ANY):
+        if neighbour != node:
+            neighbourhoods[node].add(neighbour)
     return {
         node: sum(len(neighbours & neighbourhoods[neighbour]) for neighbour in neighbours) // 2
         for node, neighbours in neighbourhoods.items()

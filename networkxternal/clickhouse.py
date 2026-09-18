@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Sequence
+from itertools import batched
 from time import time_ns
 from urllib.parse import urlparse
 
@@ -25,6 +26,7 @@ from networkxternal.base_api import (
     BaseGraph,
     BaseMultiDiGraph,
     BaseMultiGraph,
+    Cursor,
     Role,
     Triple,
 )
@@ -67,6 +69,9 @@ class ClickHouseGraph(BaseGraph):
 
     PAGE = 1 << 20
     """A column store punishes small inserts with too many parts, so pages here are far larger than a row store's."""
+
+    WRITE = 1 << 16
+    """How many rows one tombstone or upsert statement carries."""
 
     def __init__(self, url: str = "clickhouse://graph:graph@localhost:8123/graph") -> None:
         super().__init__()
@@ -127,29 +132,63 @@ class ClickHouseGraph(BaseGraph):
         keys = list(dict.fromkeys(nodes))
         if not keys:
             return
-        stored = [triple for triples in self.find_edges(keys, Role.ANY) for triple in triples]
-        if stored:
-            self.drop_edges(*zip(*stored, strict=True))
+        for page in batched(self.adjacent_edges(keys, Role.ANY), self.WRITE):
+            self.drop_edges(*zip(*(triple for _, triple in page), strict=True))
         version = self._version()
         self.client.insert(
             "nodes", [[int(key), version, 1] for key in keys], column_names=["node", "version", "is_deleted"]
         )
 
-    def find_edges(self, nodes: Sequence[int], role: Role) -> list[list[Triple]]:
-        keys = list(nodes)
+    def scan_edges(self, after: Cursor = None, limit: int | None = None) -> Iterator[Triple]:
+        """Streams whole blocks out of the part ordered by `(source, target, edge)`, never a whole result set."""
+        beyond = "" if after is None else "AND (source, target, edge) > {after:Tuple(UInt64, UInt64, UInt64)}"
+        taken = "" if limit is None else f"LIMIT {int(limit)}"
+        query = f"""
+        SELECT source, target, edge FROM edges FINAL
+        WHERE is_deleted = 0 {beyond} ORDER BY source, target, edge {taken}
+        """
+        parameters = {} if after is None else {"after": tuple(after)}
+        with self.client.query_row_block_stream(query, parameters=parameters) as stream:
+            for block in stream:
+                for row in block:
+                    yield (row[0], row[1], row[2])
+
+    def adjacent_edges(self, nodes: Sequence[int], role: Role) -> Iterator[tuple[int, Triple]]:
+        keys = list(dict.fromkeys(int(node) for node in nodes))
         if not keys:
-            return []
-        grouped: dict[int, list[Triple]] = {key: [] for key in keys}
+            return
+        loops: set[Triple] = set()
         for table, column in self._tables_for(role):
             query = f"""
             SELECT source, target, edge FROM {table} FINAL
-            WHERE {column} IN {{keys:Array(UInt64)}} AND is_deleted = 0
+            WHERE {column} IN {{keys:Array(UInt64)}} AND is_deleted = 0 ORDER BY {column}, edge
             """
-            for source, target, edge in self.client.query(query, parameters={"keys": keys}).result_rows:
-                end = source if column == "source" else target
-                if end in grouped and (source, target, edge) not in grouped[end]:
-                    grouped[end].append((source, target, edge))
-        return [grouped[key] for key in keys]
+            with self.client.query_row_block_stream(query, parameters={"keys": keys}) as stream:
+                for block in stream:
+                    for source, target, edge in block:
+                        # A self-loop sits in both tables, so the second one skips what the first reported.
+                        if source == target and role is Role.ANY:
+                            if (source, target, edge) in loops:
+                                continue
+                            loops.add((source, target, edge))
+                        yield (source if column == "source" else target), (source, target, edge)
+
+    def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
+        positions: dict[tuple[int, int], list[int]] = {}
+        for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
+            positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
+        if not positions:
+            return
+        asked = list(positions)
+        if not self.DIRECTED:
+            asked += [(target, source) for source, target in positions]
+        query = """
+        SELECT source, target, edge FROM edges FINAL
+        WHERE (source, target) IN {pairs:Array(Tuple(UInt64, UInt64))} AND is_deleted = 0
+        """
+        for source, target, edge in self.client.query(query, parameters={"pairs": asked}).result_rows:
+            for position in positions[self.canonical_pair(source, target)]:
+                yield position, (source, target, edge)
 
     def _tables_for(self, role: Role) -> tuple[tuple[str, str], ...]:
         """Which table answers a lookup in that role: the one ordered by the end being looked up."""

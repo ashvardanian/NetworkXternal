@@ -20,6 +20,7 @@ from networkxternal.base_api import (
     BaseGraph,
     BaseMultiDiGraph,
     BaseMultiGraph,
+    Cursor,
     Role,
     Triple,
 )
@@ -36,6 +37,9 @@ class MongoGraph(BaseGraph):
 
     PAGE = 10_000
     """Batch writes beyond this size bring no further throughput and cost a lot of memory on the server."""
+
+    PAIRS = 1_000
+    """How many pairs one `$or` carries; the planner stops folding it into index scans well before the document cap."""
 
     def __init__(self, url: str = "mongodb://localhost:27017/graph") -> None:
         super().__init__()
@@ -101,18 +105,64 @@ class MongoGraph(BaseGraph):
         self.edges_collection.delete_many(self._role_filter(nodes, Role.ANY))
         self.nodes_collection.delete_many({"_id": {"$in": list(nodes)}})
 
-    def find_edges(self, nodes: Sequence[int], role: Role) -> list[list[Triple]]:
-        keys = list(nodes)
-        if not keys:
-            return []
-        grouped: dict[int, list[Triple]] = {key: [] for key in keys}
-        found = self.edges_collection.find(self._role_filter(keys, role), {"source": 1, "target": 1})
-        for document in found:
-            source, target = document["source"], document["target"]
-            for end in self._ends(source, target, role):
-                if end in grouped:
-                    grouped[end].append((source, target, document["_id"]))
-        return [grouped[key] for key in keys]
+    ORDER = [("source", pymongo.ASCENDING), ("target", pymongo.ASCENDING), ("_id", pymongo.ASCENDING)]
+    """The key order every stream resumes by, which the compound index already serves."""
+
+    def scan_edges(self, after: Cursor = None, limit: int | None = None) -> Iterator[Triple]:
+        remaining = limit
+        cursor = after
+        while remaining is None or remaining > 0:
+            width = self.PAGE if remaining is None else min(self.PAGE, remaining)
+            page = self._edge_page({}, cursor, width)
+            yield from page
+            if len(page) < width:
+                return
+            cursor = page[-1]
+            if remaining is not None:
+                remaining -= len(page)
+
+    def adjacent_edges(self, nodes: Sequence[int], role: Role) -> Iterator[tuple[int, Triple]]:
+        keys = list(dict.fromkeys(int(node) for node in nodes))
+        for page in batched(keys, self.PAGE):
+            wanted = set(page)
+            cursor: Cursor = None
+            while True:
+                found = self._edge_page(self._role_filter(list(page), role), cursor, self.PAGE)
+                for source, target, edge in found:
+                    for end in self._ends(source, target, role):
+                        if end in wanted:
+                            yield end, (source, target, edge)
+                if len(found) < self.PAGE:
+                    break
+                cursor = found[-1]
+
+    def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
+        positions: dict[tuple[int, int], list[int]] = {}
+        for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
+            positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
+        for page in batched(positions, self.PAIRS):
+            clauses = [{"source": source, "target": target} for source, target in page]
+            if not self.DIRECTED:
+                clauses += [{"source": target, "target": source} for source, target in page]
+            found = self.edges_collection.find({"$or": clauses}, {"source": 1, "target": 1})
+            for document in found:
+                source, target = document["source"], document["target"]
+                for position in positions[self.canonical_pair(source, target)]:
+                    yield position, (source, target, document["_id"])
+
+    def _edge_page(self, wanted: dict, after: Cursor, width: int) -> list[Triple]:
+        """One page of edges in key order, resumed after `after`, read whole so no cursor stays open."""
+        query = dict(wanted)
+        if after is not None:
+            source, target, edge = after
+            beyond = [
+                {"source": {"$gt": source}},
+                {"source": source, "target": {"$gt": target}},
+                {"source": source, "target": target, "_id": {"$gt": edge}},
+            ]
+            query = {"$and": [query, {"$or": beyond}]} if query else {"$or": beyond}
+        found = self.edges_collection.find(query, {"source": 1, "target": 1}).sort(self.ORDER).limit(width)
+        return [(document["source"], document["target"], document["_id"]) for document in found]
 
     def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
         keys = list(nodes)

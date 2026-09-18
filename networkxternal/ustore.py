@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Sequence
-from itertools import islice
+from itertools import batched, islice
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ from networkxternal.base_api import (
     BaseGraph,
     BaseMultiDiGraph,
     BaseMultiGraph,
+    Cursor,
     Role,
     Triple,
 )
@@ -107,12 +108,48 @@ class UStoreGraph(BaseGraph):
         if len(nodes):
             self.view.graph_remove_vertices(list(nodes), collection=self.graph_collection)
 
-    def find_edges(self, nodes: Sequence[int], role: Role) -> list[list[Triple]]:
-        keys = list(nodes)
-        if not keys:
-            return []
-        found = self.view.graph_find_edges(keys, role=role.value, collection=self.graph_collection)
-        return [self._triples(found, index) for index in range(len(keys))]
+    def scan_edges(self, after: Cursor = None, limit: int | None = None) -> Iterator[Triple]:
+        """Walks the vertices in key order and reports the edges leaving each, which is how the engine stores them."""
+        taken = 0
+        start = None if after is None else after[0]
+        for page in batched(scan_keys(self.view, self.graph_collection, self.PAGE), self.PAGE):
+            keys = [key for key in page if start is None or key >= start]
+            if not keys:
+                continue
+            found = self.view.graph_find_edges(keys, role=Role.SOURCE.value, collection=self.graph_collection)
+            for index, key in enumerate(keys):
+                for triple in self._triples(found, index):
+                    if after is not None and (key, triple[1], triple[2]) <= after:
+                        continue
+                    yield triple
+                    taken += 1
+                    if limit is not None and taken >= limit:
+                        return
+
+    def adjacent_edges(self, nodes: Sequence[int], role: Role) -> Iterator[tuple[int, Triple]]:
+        """One call per page of vertices, which is the engine's own unit — a vertex's edges arrive together."""
+        keys = list(dict.fromkeys(int(node) for node in nodes))
+        for page in batched(keys, self.PAGE):
+            found = self.view.graph_find_edges(list(page), role=role.value, collection=self.graph_collection)
+            for index, key in enumerate(page):
+                for triple in self._triples(found, index):
+                    yield key, triple
+
+    def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
+        """One lookup of the distinct sources, filtered to the pairs asked about."""
+        positions: dict[tuple[int, int], list[int]] = {}
+        for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
+            positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
+        if not positions:
+            return
+        wanted = list({source for source, _ in positions})
+        reported: set[tuple[int, Triple]] = set()
+        for _, triple in self.adjacent_edges(wanted, self.outgoing_role):
+            pair = self.canonical_pair(triple[0], triple[1])
+            for position in positions.get(pair, ()):
+                if (position, triple) not in reported:
+                    reported.add((position, triple))
+                    yield position, triple
 
     def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
         keys = list(nodes)
