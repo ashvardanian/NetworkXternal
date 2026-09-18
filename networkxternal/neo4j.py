@@ -2,7 +2,7 @@
 
 Community Neo4J serves one database per instance, so a graph is named by its labels rather than by a
 database: vertices carry `<name>` and relationships `<name>_EDGE`, which keeps disjoint graphs apart
-in one server. Labels cannot be bound as parameters, so the name is validated once and interpolated.
+in one server. Labels cannot be bound as parameters, so the name is quoted once and interpolated.
 """
 
 from __future__ import annotations
@@ -28,11 +28,11 @@ BATCH = 1_000
 
 
 def graph_name(url: str, default: str = "Graph") -> str:
-    """The label a connection string names, restricted to the identifiers Cypher accepts unquoted."""
+    """The label a connection string names; a backtick would end the quoting the label is written in."""
     parts = [part for part in urlparse(url).path.split("/") if part]
     name = parts[0] if parts else default
-    if not name.isidentifier():
-        raise ValueError(f"A graph name must be a plain identifier, got {name!r}")
+    if "`" in name:
+        raise ValueError(f"A graph name may not hold a backtick, got {name!r}")
     return name[0].upper() + name[1:]
 
 
@@ -48,14 +48,15 @@ class Neo4JGraph(BaseGraph):
             f"{address.scheme}://{address.hostname}:{address.port}",
             auth=(address.username, address.password) if address.username else None,
         )
-        self.vertex = graph_name(url)
-        self.edge = f"{self.vertex.upper()}_EDGE"
+        self.vertex = f"`{graph_name(url)}`"
+        self.edge = f"`{graph_name(url).upper()}_EDGE`"
         self._create_indexes()
 
     def _create_indexes(self) -> None:
         with self.driver.session() as session:
-            session.run(f"CREATE INDEX {self.vertex}_id IF NOT EXISTS FOR (v:{self.vertex}) ON (v.id)")
-            session.run(f"CREATE INDEX {self.vertex}_edge IF NOT EXISTS FOR ()-[e:{self.edge}]-() ON (e.id)")
+            name = self.vertex.strip("`")
+            session.run(f"CREATE INDEX `{name}_id` IF NOT EXISTS FOR (v:{self.vertex}) ON (v.id)")
+            session.run(f"CREATE INDEX `{name}_edge` IF NOT EXISTS FOR ()-[e:{self.edge}]-() ON (e.id)")
 
     def _pattern(self, role: Role) -> str:
         """The match pattern that binds `v` to the given vertex in that role."""
@@ -145,6 +146,10 @@ class Neo4JGraph(BaseGraph):
         with self.driver.session() as session:
             session.run(query, keys=keys)
 
+    def count_edges(self) -> int:
+        with self.driver.session() as session:
+            return session.run(f"MATCH ()-[e:{self.edge}]->() RETURN count(e) AS count").single()["count"]
+
     def biggest_edge_id(self) -> int:
         with self.driver.session() as session:
             found = session.run(f"MATCH ()-[e:{self.edge}]->() RETURN max(e.id) AS biggest").single()
@@ -194,6 +199,9 @@ class Neo4JGraph(BaseGraph):
         with self.driver.session() as session:
             session.run(f"MATCH (v:{self.vertex}) CALL (v) {{ DETACH DELETE v }} IN TRANSACTIONS OF {BATCH} ROWS")
         self.next_edge_id = None
+
+    def close(self) -> None:
+        self.driver.close()
 
     # endregion Storage Verbs
 
