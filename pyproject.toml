@@ -1,50 +1,92 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
 [project]
 name = "networkxternal"
-version = "0.3.0"
-description = "NetworkX-like Python experience for Postgres, SQLite, MongoDB, and Neo4J"
+version = "0.4.0"
+description = "NetworkX-like Python experience for UStore, ClickHouse, Postgres, SQLite, MongoDB, and Neo4J"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
 authors = [
     { name = "Ash Vardanian", email = "1983160+ashvardanian@users.noreply.github.com" },
 ]
-readme = "README.md"
-requires-python = ">=3.8"
-
-dependencies = [
-    "networkx",
-    "sqlalchemy",
-    "neo4j",
-    "pymongo",
-]
-
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "Topic :: Database",
-
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
+    "Intended Audience :: Information Technology",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Scientific/Engineering :: Information Analysis",
 ]
+dependencies = []
+
+# A backend pulls in its own driver and nothing else, so one missing server never blocks the rest.
+[project.optional-dependencies]
+all = [
+    "clickhouse-connect>=1.8",
+    "neo4j>=6",
+    "networkx>=3.6",
+    "psycopg[binary]>=3.3",
+    "pymongo>=4.18",
+    "sqlalchemy-utils>=0.42",
+    "sqlalchemy>=2.0.54",
+]
+clickhouse = ["clickhouse-connect>=1.8"]
+mongodb = ["pymongo>=4.18"]
+mysql = ["mysqlclient>=2.3", "sqlalchemy-utils>=0.42", "sqlalchemy>=2.0.54"]
+neo4j = ["neo4j>=6"]
+networkx = ["networkx>=3.6"]
+postgres = [
+    "psycopg[binary]>=3.3",
+    "sqlalchemy-utils>=0.42",
+    "sqlalchemy>=2.0.54",
+]
+sqlite = ["sqlalchemy-utils>=0.42", "sqlalchemy>=2.0.54"]
+# UStore 1.0 is not on PyPI yet, so its backend installs from the engine's own tree:
+#   pip install /path/to/UStore
+
+[project.urls]
+Homepage = "https://github.com/ashvardanian/NetworkXternal"
+Issues = "https://github.com/ashvardanian/NetworkXternal/issues"
+Repository = "https://github.com/ashvardanian/NetworkXternal"
+
+# Groups rather than extras, so none of this reaches the published wheel's metadata.
+[dependency-groups]
+bench = ["networkx>=3.6", "psutil>=7"]
+lint = ["ruff>=0.16"]
+# NumPy and SciPy back the NetworkX algorithms the semi-external ones are compared against.
+test = ["networkx>=3.6", "numpy>=2.5", "pytest>=9", "scipy>=1.16", "sqlalchemy-utils>=0.42", "sqlalchemy>=2.0.54"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["networkxternal"]
 
 [tool.pytest.ini_options]
-minversion = "6.0"
-addopts = "-ra -q"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["networkxternal*"]
-exclude = ["assets", "benchmarks"]
+addopts = ["-ra", "--showlocals", "--strict-config", "--strict-markers"]
+filterwarnings = ["error"]
+markers = [
+    "server: needs a database server, started from benchmarks/docker-compose.yml",
+]
+minversion = "8.0"
+python_files = ["*.py"]
+testpaths = ["test"]
+xfail_strict = true
 
 [tool.ruff]
 line-length = 120
-select = ["E", "F", "W", "C90"]
+target-version = "py312"
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[tool.ruff.lint]
+select = ["B", "C90", "E", "F", "I", "SIM", "UP", "W"]
 
-[dependency-groups]
-dev = ["ruff>=0.9.9", "pytest"]
+[tool.ruff.lint.isort]
+known-first-party = ["networkxternal"]
