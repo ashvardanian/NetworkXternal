@@ -235,11 +235,14 @@ class Neo4JGraph(BaseGraph):
             session.run(query, rows=rows)
 
     def drop_documents(self, store: AttributeStore, keys: Sequence[int]) -> None:
-        """A relationship's properties leave with the relationship; a vertex keeps only its `id`."""
+        """Strips every property but the identifier, from a vertex or from a relationship that outlives it."""
         keys = list(keys)
-        if not keys or store is AttributeStore.EDGES:
+        if not keys:
             return
-        query = f"UNWIND $keys AS key MATCH (v:{self.vertex} {{id: key}}) SET v = {{id: key}}"
+        if store is AttributeStore.NODES:
+            query = f"UNWIND $keys AS key MATCH (v:{self.vertex} {{id: key}}) SET v = {{id: key}}"
+        else:
+            query = f"UNWIND $keys AS key MATCH ()-[e:{self.edge} {{id: key}}]-() SET e = {{id: key}}"
         with self.driver.session() as session:
             session.run(query, keys=keys)
 
