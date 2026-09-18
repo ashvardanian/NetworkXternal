@@ -27,6 +27,7 @@ from networkxternal.base_api import (
     BaseMultiDiGraph,
     BaseMultiGraph,
     Cursor,
+    EdgeLayout,
     Role,
     Triple,
 )
@@ -67,11 +68,17 @@ SCHEMA = (
 class ClickHouseGraph(BaseGraph):
     """An undirected simple graph stored in ClickHouse, as `networkx.Graph` is in RAM."""
 
+    LAYOUT = EdgeLayout.MIRRORED
+    """An undirected edge is two rows sharing one identifier, one ordered by each end, since there is no index."""
+
     PAGE = 1 << 20
     """A column store punishes small inserts with too many parts, so pages here are far larger than a row store's."""
 
     WRITE = 1 << 16
     """How many rows one tombstone or upsert statement carries."""
+
+    CONCURRENT = False
+    """A `clickhouse_connect` client runs one query per session, so a thread needs a client of its own."""
 
     def __init__(self, url: str = "clickhouse://graph:graph@localhost:8123/graph") -> None:
         super().__init__()
@@ -224,11 +231,14 @@ class ClickHouseGraph(BaseGraph):
         self.upsert_nodes([end for source, target, _ in triples for end in (source, target)])
 
     def drop_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
+        """Tombstones the edge in every orientation, since a part collapses on `(source, target, edge)` alone."""
         triples = list(zip(sources, targets, edges, strict=True))
         if not triples:
             return
         version = self._version()
         rows = [[int(edge), int(source), int(target), version, 1] for source, target, edge in triples]
+        if not self.DIRECTED:
+            rows += [[int(edge), int(target), int(source), version, 1] for source, target, edge in triples]
         self.client.insert("edges", rows, column_names=["edge", "source", "target", "version", "is_deleted"])
 
     def count_edges(self) -> int:
