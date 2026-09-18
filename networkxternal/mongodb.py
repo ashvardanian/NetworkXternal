@@ -2,6 +2,8 @@
 
 Vertices live in a collection of their own, so an isolated vertex survives the removal of its last
 edge, and both attribute stores are plain document collections that `$set` merges field by field.
+An undirected edge is one document holding `source <= target`, so a pair lookup is a single equality
+probe on the compound index while adjacency still reads both of them.
 """
 
 from __future__ import annotations
@@ -21,8 +23,10 @@ from networkxternal.base_api import (
     BaseMultiDiGraph,
     BaseMultiGraph,
     Cursor,
+    EdgeLayout,
     Role,
     Triple,
+    numeric_weight,
 )
 
 
@@ -34,6 +38,9 @@ def database_name(url: str, default: str = "graph") -> str:
 
 class MongoGraph(BaseGraph):
     """An undirected simple graph stored in MongoDB, as `networkx.Graph` is in RAM."""
+
+    LAYOUT = EdgeLayout.CANONICAL
+    """One document holds an undirected edge with `source <= target`, so a pair is one equality probe."""
 
     PAGE = 10_000
     """Batch writes beyond this size bring no further throughput and cost a lot of memory on the server."""
@@ -142,12 +149,10 @@ class MongoGraph(BaseGraph):
             positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
         for page in batched(positions, self.PAIRS):
             clauses = [{"source": source, "target": target} for source, target in page]
-            if not self.DIRECTED:
-                clauses += [{"source": target, "target": source} for source, target in page]
             found = self.edges_collection.find({"$or": clauses}, {"source": 1, "target": 1})
             for document in found:
                 source, target = document["source"], document["target"]
-                for position in positions[self.canonical_pair(source, target)]:
+                for position in positions[(source, target)]:
                     yield position, (source, target, document["_id"])
 
     def _edge_page(self, wanted: dict, after: Cursor, width: int) -> list[Triple]:
@@ -183,7 +188,10 @@ class MongoGraph(BaseGraph):
     def upsert_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
         if not len(sources):
             return
-        triples = list(zip(sources, targets, edges, strict=True))
+        triples = [
+            (*self.canonical_pair(int(source), int(target)), int(edge))
+            for source, target, edge in zip(sources, targets, edges, strict=True)
+        ]
         writes = [
             UpdateOne({"_id": edge}, {"$set": {"source": source, "target": target}}, upsert=True)
             for source, target, edge in triples
@@ -201,6 +209,18 @@ class MongoGraph(BaseGraph):
     def biggest_edge_id(self) -> int:
         found = self.edges_collection.find({}, {"_id": 1}).sort("_id", pymongo.DESCENDING).limit(1)
         return next((document["_id"] for document in found), 0)
+
+    def edge_weights(self, edges: Sequence[int], name: str = "weight") -> list[float | None]:
+        """Projects the one field out of every attribute document, which BSON already holds as a number."""
+        keys = list(edges)
+        if not keys:
+            return []
+        store = self.stores[AttributeStore.EDGES]
+        found = {
+            document["_id"]: numeric_weight(document.get(name))
+            for document in store.find({"_id": {"$in": keys}}, {name: 1})
+        }
+        return [found.get(key) for key in keys]
 
     def read_documents(self, store: AttributeStore, keys: Sequence[int]) -> list[Attributes]:
         keys = list(keys)

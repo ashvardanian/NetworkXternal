@@ -36,6 +36,24 @@ class AttributeStore(StrEnum):
     EDGES = "edges"
 
 
+class EdgeLayout(StrEnum):
+    """How a backend stores an undirected edge, which decides what a reverse lookup costs."""
+
+    NATIVE = "native"
+    """The engine reaches a relationship from either end on its own: UStore, Neo4J and Memgraph."""
+
+    CANONICAL = "canonical"
+    """One row per edge, holding `source <= target` because the write normalized it: SQL and MongoDB."""
+
+    MIRRORED = "mirrored"
+    """Two rows sharing one edge identifier, one ordered by each end: ClickHouse, which has no secondary index."""
+
+
+def numeric_weight(value: Any) -> float | None:
+    """A weight as a float, or `None` where the attribute is missing, boolean, or not a number."""
+    return float(value) if type(value) is int or type(value) is float else None
+
+
 class NodeView:
     """The vertices of a graph: iterable, sized, and callable for their attributes, as `Graph.nodes` is."""
 
@@ -169,6 +187,9 @@ class BaseGraph(ABC):
     DIRECTED: ClassVar[bool] = False
     MULTIGRAPH: ClassVar[bool] = False
 
+    LAYOUT: ClassVar[EdgeLayout] = EdgeLayout.NATIVE
+    """How this backend stores an undirected edge, which a reverse lookup and a removal both consult."""
+
     PAGE: ClassVar[int] = 1 << 12
     """How many keys one round-trip carries; a backend lowers it where the wire format is heavy."""
 
@@ -256,6 +277,13 @@ class BaseGraph(ABC):
     @abstractmethod
     def drop_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
         """Removes edges, skipping the ones that are not stored, and keeps their vertices."""
+
+    def edge_weights(self, edges: Sequence[int], name: str = "weight") -> list[float | None]:
+        """The numeric weight of every edge under `name`, `None` where it is missing or not a number.
+
+        A store holding weights in a typed column or field overrides this read of whole documents.
+        """
+        return [numeric_weight(found.get(name)) for found in self.read_documents(AttributeStore.EDGES, edges)]
 
     def count_edges(self) -> int:
         """How many edges the graph holds; a store that can count them outright overrides this walk."""
