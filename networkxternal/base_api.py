@@ -1,378 +1,727 @@
-from abc import abstractmethod
-from typing import Sequence, Optional, Set
+"""NetworkX-shaped views and writes over an external store, on the storage verbs every backend implements."""
 
-from networkxternal.helpers.edge import Edge
-from networkxternal.helpers.node import Node
-from networkxternal.helpers.graph_degree import GraphDegree
-from networkxternal.helpers.algorithms import is_sequence_of, chunks
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from enum import StrEnum
+from itertools import batched
+from typing import Any, ClassVar
+
+type Attributes = dict[str, Any]
+type Triple = tuple[int, int, int]
+type NodeBunch = int | Iterable[int] | None
+
+FIRST_EDGE_ID = 1
+"""The edge identifier a graph starts handing out from."""
 
 
-class BaseAPI(object):
-    """
-    Abstract base class for Graph Datastructures.
-    It's designed for directed weighted graphs, but can be easily tweaked.
-    By default, it allows multi-edges (multiple edges connecting same nodes).
-    Easiest way to preserve edge uniqueness is to generate edge IDs
-    by hashing IDs of nodes that it's connecting.
+class NetworkXternalError(Exception):
+    """Raised where NetworkX raises `NetworkXError`: a vertex or edge the graph does not hold."""
 
-    Partially compatible with `MultiDiGraph` from NetworkX package.
-    Explicitly supported edge attributes are: `_id: int` `weight: float`, `label: int`, `directed: bool`.
-    Explicitly supported node attributes are: `_id: int` `weight: float`, `label: int`.
-    Non-integer node names will be hashed.
-    The hashable `key` will be transformed into the `label` property of nodes and edges.
-    Docs: https://networkx.github.io/documentation/stable/reference/classes/multidigraph.html
-    """
 
-    __max_batch_size__ = 100
-    __is_concurrent__ = True
-    __edge_type__ = Edge
-    __node_type__ = Node
-    __in_memory__ = False
+class Role(StrEnum):
+    """The end of an edge a vertex is looked up by."""
+
+    SOURCE = "source"
+    TARGET = "target"
+    ANY = "any"
+
+
+class AttributeStore(StrEnum):
+    """Which of the two attribute stores a document read or write addresses."""
+
+    NODES = "nodes"
+    EDGES = "edges"
+
+
+class NodeView:
+    """The vertices of a graph: iterable, sized, and callable for their attributes, as `Graph.nodes` is."""
+
+    def __init__(self, graph: BaseGraph) -> None:
+        self.graph = graph
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.graph)
+
+    def __len__(self) -> int:
+        return self.graph.number_of_nodes()
+
+    def __contains__(self, node: int) -> bool:
+        return self.graph.has_node(node)
+
+    def __getitem__(self, node: int) -> Attributes:
+        if not self.graph.has_node(node):
+            raise KeyError(node)
+        return self.graph.read_documents(AttributeStore.NODES, [node])[0]
+
+    def __call__(self, data: bool | str = False, default: Any = None) -> Iterator[int] | Iterator[tuple[int, Any]]:
+        if data is False:
+            return iter(self.graph)
+        return self._with_data(data, default)
+
+    def _with_data(self, data: bool | str, default: Any) -> Iterator[tuple[int, Any]]:
+        for page in batched(self.graph, self.graph.PAGE):
+            attributes = self.graph.read_documents(AttributeStore.NODES, page)
+            for node, found in zip(page, attributes, strict=True):
+                yield (node, found) if data is True else (node, found.get(data, default))
+
+
+class EdgeView:
+    """The edges of a graph: iterable, sized, and callable for keys and attributes, as `Graph.edges` is."""
+
+    def __init__(self, graph: BaseGraph) -> None:
+        self.graph = graph
+
+    def __iter__(self) -> Iterator[tuple[int, ...]]:
+        """Every edge as its two ends, followed by its key in a multigraph."""
+        return self(keys=self.graph.MULTIGRAPH)
+
+    def __len__(self) -> int:
+        return self.graph.number_of_edges()
+
+    def __contains__(self, edge: tuple[int, int]) -> bool:
+        return self.graph.has_edge(*edge)
+
+    def __call__(
+        self,
+        nbunch: NodeBunch = None,
+        data: bool | str = False,
+        keys: bool = False,
+        default: Any = None,
+    ) -> Iterator[tuple[Any, ...]]:
+        if keys and not self.graph.MULTIGRAPH:
+            raise TypeError("Only a multigraph reports edge keys")
+        for page in batched(self.graph.edge_triples(nbunch), self.graph.PAGE):
+            identifiers = [edge for _, _, edge in page]
+            attributes = (
+                self.graph.read_documents(AttributeStore.EDGES, identifiers)
+                if data is not False
+                else [None] * len(page)
+            )
+            for (source, target, edge), found in zip(page, attributes, strict=True):
+                head = (source, target, edge) if keys else (source, target)
+                if data is False:
+                    yield head
+                elif data is True:
+                    yield (*head, found)
+                else:
+                    yield (*head, found.get(data, default))
+
+
+class DegreeView:
+    """Degrees of vertices in one role: indexable by vertex, iterable as pairs, callable with weights."""
 
     def __init__(
         self,
-        directed=True,
-        weighted=True,
-        multigraph=True,
-        **kwargs,
-    ):
-        object.__init__(self)
-        self.directed = directed
-        self.weighted = weighted
-        self.multigraph = multigraph
+        graph: BaseGraph,
+        role: Role,
+        weight: str | None = None,
+        nodes: list[int] | None = None,
+    ) -> None:
+        self.graph = graph
+        self.role = role
+        self.weight = weight
+        self.nodes = nodes
 
-    # region Metadata
+    def __getitem__(self, node: int) -> int | float:
+        if not self.graph.has_node(node):
+            raise KeyError(node)
+        return next(self._degrees([node]))[1]
+
+    def __iter__(self) -> Iterator[tuple[int, int | float]]:
+        pages = batched(self.graph if self.nodes is None else self.nodes, self.graph.PAGE)
+        for page in pages:
+            yield from self._degrees(list(page))
+
+    def __call__(self, nbunch: NodeBunch = None, weight: str | None = None) -> int | float | DegreeView:
+        if not isinstance(nbunch, Iterable | None):
+            return DegreeView(self.graph, self.role, weight)[nbunch]
+        return DegreeView(self.graph, self.role, weight, None if nbunch is None else list(nbunch))
+
+    def _degrees(self, nodes: list[int]) -> Iterator[tuple[int, int | float]]:
+        if self.weight is None:
+            counts = self.graph.degrees(nodes, self.role)
+            yield from ((node, count or 0) for node, count in zip(nodes, counts, strict=True))
+            return
+        found = self.graph.find_edges(nodes, self.role)
+        identifiers = [edge for triples in found for _, _, edge in triples]
+        attributes = self.graph.read_documents(AttributeStore.EDGES, identifiers)
+        held = iter(attributes)
+        for node, triples in zip(nodes, found, strict=True):
+            total: float = 0
+            for source, target, _ in triples:
+                weight = next(held).get(self.weight, 1)
+                # NetworkX counts an undirected self-loop at both of its ends.
+                total += weight * 2 if source == target and self.role is Role.ANY else weight
+            yield node, total
+
+
+class BaseGraph(ABC):
+    """An undirected graph holding at most one edge between two vertices, as `networkx.Graph` does.
+
+    A backend implements the storage verbs of the region below and inherits every view, traversal and
+    attribute map from here. Every read reaches the store, so a graph holds nothing that could go stale.
+    """
+
+    DIRECTED: ClassVar[bool] = False
+    MULTIGRAPH: ClassVar[bool] = False
+
+    PAGE: ClassVar[int] = 1 << 12
+    """How many keys one round-trip carries; a backend lowers it where the wire format is heavy."""
+
+    CONCURRENT: ClassVar[bool] = True
+    """Whether one instance serves several threads, which a free-threaded interpreter exploits."""
+
+    __networkx_backend__: ClassVar[str] = "networkxternal"
+    """The name NetworkX dispatches by, so `nx.pagerank(graph, backend="networkxternal")` finds this graph."""
+
+    def __init__(self) -> None:
+        self.next_edge_id: int | None = None
+        self.graph: dict[str, Any] = {}
+
+    @property
+    def name(self) -> str:
+        return self.graph.get("name", "")
+
+    @name.setter
+    def name(self, name: str) -> None:
+        self.graph["name"] = name
+
+    def __str__(self) -> str:
+        kind = type(self).__name__
+        return f"{self.name or kind} with {self.number_of_nodes()} nodes and {self.number_of_edges()} edges"
+
+    def is_directed(self) -> bool:
+        return self.DIRECTED
+
+    def is_multigraph(self) -> bool:
+        return self.MULTIGRAPH
+
+    # region Storage Verbs
 
     @abstractmethod
-    def reduce_nodes(self) -> GraphDegree:
-        return GraphDegree(0, 0)
+    def scan_nodes(self) -> Iterator[int]:
+        """Yields every vertex of the graph, holding at most one page of them at a time."""
 
     @abstractmethod
-    def reduce_edges(self, u=None, v=None, key=None) -> GraphDegree:
-        """
-        We count all the edges that have `u` or `v`. Both can be set to `None`.
-        If both are set to the same integer value, we will search for edges containing that edge in any role.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.number_of_edges.html#networkx.MultiDiGraph.number_of_edges
-        """
-        return GraphDegree(0, 0)
+    def has_node(self, node: int) -> bool:
+        """Whether the graph holds that vertex."""
+
+    @abstractmethod
+    def number_of_nodes(self) -> int:
+        """How many vertices the graph holds."""
+
+    @abstractmethod
+    def upsert_nodes(self, nodes: Sequence[int]) -> None:
+        """Inserts vertices, leaving the ones already stored as they are."""
+
+    @abstractmethod
+    def drop_nodes(self, nodes: Sequence[int]) -> None:
+        """Removes vertices together with every edge they take part in, but not their attributes."""
+
+    @abstractmethod
+    def find_edges(self, nodes: Sequence[int], role: Role) -> list[list[Triple]]:
+        """The (source, target, edge) triples every vertex takes part in, one list per given vertex."""
+
+    @abstractmethod
+    def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
+        """How many edges every vertex takes part in, in that role."""
+
+    @abstractmethod
+    def upsert_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
+        """Inserts edges with their vertices, overwriting the ones stored under the same identifier."""
+
+    @abstractmethod
+    def drop_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
+        """Removes edges, skipping the ones that are not stored, and keeps their vertices."""
+
+    def count_edges(self) -> int:
+        """How many edges the graph holds; a store that can count them outright overrides this walk."""
+        return sum(degree for _, degree in DegreeView(self, Role.SOURCE))
+
+    def close(self) -> None:
+        """Releases the connections or handles the backend holds; a store needing none overrides nothing."""
+        return None
+
+    def __enter__(self) -> BaseGraph:
+        return self
+
+    def __exit__(self, *arguments: object) -> None:
+        self.close()
 
     @abstractmethod
     def biggest_edge_id(self) -> int:
-        return 0
+        """The largest edge identifier the graph holds, or zero when it holds none."""
 
-    def number_of_nodes(self) -> int:
-        cnt_registered = self.reduce_nodes().count
-        if cnt_registered > 0:
-            return cnt_registered
-        return len(self.mentioned_nodes_ids)
+    @abstractmethod
+    def read_documents(self, store: AttributeStore, keys: Sequence[int]) -> list[Attributes]:
+        """The attribute document of every key, an empty one where there is none."""
 
-    def number_of_edges(self, u=None, v=None, key=None) -> int:
-        return self.reduce_edges(u, v, key).count
+    @abstractmethod
+    def merge_documents(self, store: AttributeStore, keys: Sequence[int], entries: Sequence[Attributes]) -> None:
+        """Merges one attribute document into every key, or one per key, as RFC 7386 does."""
+
+    @abstractmethod
+    def drop_documents(self, store: AttributeStore, keys: Sequence[int]) -> None:
+        """Removes the attribute document of every key."""
+
+    @abstractmethod
+    def clear(self) -> None:
+        """Removes every vertex, every edge, and the attributes of both."""
+
+    # endregion Storage Verbs
+
+    # region Vertices
+
+    def __iter__(self) -> Iterator[int]:
+        return self.scan_nodes()
 
     def __len__(self) -> int:
-        """
-        Uses `self.number_of_nodes()`.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.Graph.__len__.html
-        """
-        return self.number_of_nodes().count
+        return self.number_of_nodes()
+
+    def __contains__(self, node: int) -> bool:
+        return self.has_node(node)
+
+    def __getitem__(self, node: int) -> dict[int, Any]:
+        """The neighbours of a vertex with the attributes of the edges reaching them, keyed by edge in a multigraph."""
+        if not self.has_node(node):
+            raise KeyError(node)
+        triples = list(self.edge_triples(node))
+        attributes = self.read_documents(AttributeStore.EDGES, [edge for _, _, edge in triples])
+        adjacency: dict[int, Any] = {}
+        for (_, neighbour, edge), found in zip(triples, attributes, strict=True):
+            if self.MULTIGRAPH:
+                adjacency.setdefault(neighbour, {})[edge] = found
+            else:
+                adjacency[neighbour] = found
+        return adjacency
+
+    @property
+    def nodes(self) -> NodeView:
+        return NodeView(self)
 
     def order(self) -> int:
-        """
-        Uses `self.number_of_nodes()`.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.Graph.number_of_nodes.html
-        """
-        return self.number_of_nodes().count
+        return self.number_of_nodes()
 
-    def is_directed(self):
-        return self.directed
+    def add_node(self, node: int, **attributes: Any) -> None:
+        self.add_nodes_from([node], **attributes)
 
-    def is_multigraph(self):
-        return self.multigraph
+    def add_nodes_from(self, nodes: Iterable[Any], **attributes: Any) -> None:
+        """Inserts vertices, or `(vertex, attributes)` pairs, merging `attributes` into every one of them."""
+        for page in batched(nodes, self.PAGE):
+            keys = [entry[0] if isinstance(entry, tuple) else entry for entry in page]
+            own = [dict(entry[1]) if isinstance(entry, tuple) else {} for entry in page]
+            self.upsert_nodes(keys)
+            if attributes or any(own):
+                self.merge_documents(AttributeStore.NODES, keys, [{**attributes, **entry} for entry in own])
 
-    # endregion
+    def remove_node(self, node: int) -> None:
+        if not self.has_node(node):
+            raise NetworkXternalError(f"The graph holds no vertex {node}")
+        self.remove_nodes_from([node])
 
-    # region Bulk Reads
+    def remove_nodes_from(self, nodes: Iterable[int]) -> None:
+        """Removes vertices with every edge they take part in and the attributes of both."""
+        for page in batched(nodes, self.PAGE):
+            found = self.find_edges(page, Role.ANY)
+            identifiers = [edge for triples in found for _, _, edge in triples]
+            self.drop_documents(AttributeStore.EDGES, identifiers)
+            self.drop_nodes(page)
+            self.drop_documents(AttributeStore.NODES, page)
 
-    @property
-    @abstractmethod
-    def nodes(self) -> Sequence[Node]:
-        """
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.nodes.html
-        """
-        return []
+    # endregion Vertices
 
-    @property
-    @abstractmethod
-    def edges(self) -> Sequence[Edge]:
-        """
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.edges.html
-        """
-        return []
-
-    @property
-    @abstractmethod
-    def out_edges(self) -> Sequence[Edge]:
-        """
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.out_edges.html
-        """
-        return [e for e in self.edges if e.directed]
+    # region Edges
 
     @property
-    @abstractmethod
-    def in_edges(self) -> Sequence[Edge]:
+    def outgoing_role(self) -> Role:
+        """The role a vertex plays in the edges it reaches its neighbours by."""
+        return Role.SOURCE if self.DIRECTED else Role.ANY
+
+    def canonical_pair(self, source: int, target: int) -> tuple[int, int]:
+        """The pair both orientations of an undirected edge share."""
+        return (source, target) if self.DIRECTED else (min(source, target), max(source, target))
+
+    def stored_between(self, sources: Sequence[int]) -> dict[tuple[int, int], list[Triple]]:
+        """Every stored edge leaving `sources`, grouped by canonical pair, in stored order."""
+        unique = list(dict.fromkeys(sources))
+        found = self.find_edges(unique, self.outgoing_role)
+        grouped: dict[tuple[int, int], list[Triple]] = {}
+        for triples in found:
+            for triple in triples:
+                entries = grouped.setdefault(self.canonical_pair(triple[0], triple[1]), [])
+                # A self-loop of an undirected graph is found once leaving and once entering.
+                if triple not in entries:
+                    entries.append(triple)
+        return grouped
+
+    def allocate_edge_ids(self, count: int) -> list[int]:
+        """Hands out identifiers past every one the graph already holds."""
+        if self.next_edge_id is None:
+            self.next_edge_id = max(self.biggest_edge_id() + 1, FIRST_EDGE_ID)
+        first = self.next_edge_id
+        self.next_edge_id += count
+        return list(range(first, first + count))
+
+    def add_edges_from_arrays(
+        self,
+        sources: Sequence[int],
+        targets: Sequence[int],
+        keys: Sequence[int | None] | None = None,
+        *,
+        columns: Mapping[str, Sequence[Any]] | None = None,
+        entries: Sequence[Attributes] | None = None,
+        **attributes: Any,
+    ) -> list[int]:
+        """Inserts a batch of edges, merging `attributes` into all of them, and `columns` or `entries` edge by edge.
+
+        Returns:
+            The identifier of every edge, in the order the edges were given.
         """
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.in_edges.html
+        sources = [int(source) for source in sources]
+        targets = [int(target) for target in targets]
+        if len(sources) != len(targets):
+            raise ValueError(f"Got {len(sources)} sources and {len(targets)} targets")
+        wanted = [None] * len(sources) if keys is None else [None if key is None else int(key) for key in keys]
+        if not self.MULTIGRAPH and any(key is not None for key in wanted):
+            raise TypeError("Only a multigraph takes edge keys")
+
+        identifiers: list[int] = []
+        upserted: list[Triple] = []
+        if self.MULTIGRAPH:
+            fresh = iter(self.allocate_edge_ids(sum(key is None for key in wanted)))
+            identifiers = [next(fresh) if key is None else key for key in wanted]
+            # A key the caller chose is never handed out again.
+            self.next_edge_id = max([self.next_edge_id or 0, *(key + 1 for key in wanted if key is not None)])
+            upserted = list(zip(sources, targets, identifiers, strict=True))
+        else:
+            stored = self.stored_between(sources)
+            pending: dict[tuple[int, int], int] = {}
+            for source, target in zip(sources, targets, strict=True):
+                pair = self.canonical_pair(source, target)
+                if pair in stored:
+                    identifiers.append(stored[pair][0][2])
+                    continue
+                if pair not in pending:
+                    pending[pair] = self.allocate_edge_ids(1)[0]
+                    upserted.append((source, target, pending[pair]))
+                identifiers.append(pending[pair])
+
+        if upserted:
+            upsert_sources, upsert_targets, upsert_edges = zip(*upserted, strict=True)
+            self.upsert_edges(upsert_sources, upsert_targets, upsert_edges)
+        if attributes or columns or entries:
+            per_edge = [
+                {
+                    **attributes,
+                    **{name: values[index] for name, values in (columns or {}).items()},
+                    **((entries or [{}] * len(identifiers))[index]),
+                }
+                for index in range(len(identifiers))
+            ]
+            shared = not columns and not entries
+            self.merge_documents(AttributeStore.EDGES, identifiers, per_edge[:1] if shared else per_edge)
+        return identifiers
+
+    def add_edge(self, source: int, target: int, **attributes: Any) -> None:
+        self.add_edges_from_arrays([source], [target], **attributes)
+
+    def add_edges_from(self, ebunch: Iterable[tuple[Any, ...]], **attributes: Any) -> None:
+        """Inserts (source, target) pairs, (source, target, attributes) triples, or keyed quadruples."""
+        for page in batched(ebunch, self.PAGE):
+            sources: list[int] = []
+            targets: list[int] = []
+            wanted: list[int | None] = []
+            entries: list[Attributes] = []
+            for edge in page:
+                source, target, *rest = edge
+                key = rest[0] if self.MULTIGRAPH and rest and not isinstance(rest[0], Mapping) else None
+                sources.append(source)
+                targets.append(target)
+                wanted.append(key)
+                entries.append(dict(rest[-1]) if rest and isinstance(rest[-1], Mapping) else {})
+            self.add_edges_from_arrays(
+                sources,
+                targets,
+                wanted if self.MULTIGRAPH else None,
+                entries=entries if any(entries) else None,
+                **attributes,
+            )
+
+    def add_weighted_edges_from(
+        self, ebunch: Iterable[tuple[int, int, float]], weight: str = "weight", **attributes: Any
+    ) -> None:
+        """Inserts `(source, target, weight)` triples, storing the weight under the attribute `weight` names."""
+        for page in batched(ebunch, self.PAGE):
+            self.add_edges_from_arrays(
+                [source for source, _, _ in page],
+                [target for _, target, _ in page],
+                columns={weight: [held for _, _, held in page]},
+                **attributes,
+            )
+
+    def remove_edges_from_arrays(
+        self,
+        sources: Sequence[int],
+        targets: Sequence[int],
+        keys: Sequence[int | None] | None = None,
+    ) -> int:
+        """Removes a batch of edges, the newest one of a pair where a multigraph names no key.
+
+        Returns:
+            The number of edges removed; pairs holding no edge are skipped.
         """
-        return [e.inverted() for e in self.out_edges]
+        sources = [int(source) for source in sources]
+        targets = [int(target) for target in targets]
+        wanted = [None] * len(sources) if keys is None else [None if key is None else int(key) for key in keys]
+        stored = self.stored_between(sources)
+        removed: list[Triple] = []
+        taken: set[Triple] = set()
+        for source, target, key in zip(sources, targets, wanted, strict=True):
+            remaining = [
+                triple for triple in stored.get(self.canonical_pair(source, target), []) if triple not in taken
+            ]
+            if not self.MULTIGRAPH:
+                removed.extend(remaining)
+            elif key is not None:
+                removed.extend(triple for triple in remaining if triple[2] == key)
+            elif remaining:
+                removed.append(max(remaining, key=lambda triple: triple[2]))
+            taken.update(removed)
+        if removed:
+            removed_sources, removed_targets, removed_edges = zip(*removed, strict=True)
+            self.drop_edges(removed_sources, removed_targets, removed_edges)
+            self.drop_documents(AttributeStore.EDGES, removed_edges)
+        return len(removed)
+
+    def remove_edge(self, source: int, target: int) -> None:
+        if self.remove_edges_from_arrays([source], [target]) == 0:
+            raise NetworkXternalError(f"The graph holds no edge between {source} and {target}")
+
+    def remove_edges_from(self, ebunch: Iterable[tuple[int, ...]]) -> None:
+        for page in batched(ebunch, self.PAGE):
+            sources = [edge[0] for edge in page]
+            targets = [edge[1] for edge in page]
+            wanted = [edge[2] if self.MULTIGRAPH and len(edge) > 2 else None for edge in page]
+            self.remove_edges_from_arrays(sources, targets, wanted)
+
+    def edge_triples(self, nbunch: NodeBunch) -> Iterator[Triple]:
+        """Every edge once, as stored for the whole graph and oriented away from `nbunch` otherwise."""
+        if nbunch is None:
+            for page in batched(self, self.PAGE):
+                for triples in self.find_edges(page, Role.SOURCE):
+                    yield from triples
+            return
+        nodes = nbunch if isinstance(nbunch, Iterable) else [nbunch]
+        seen: set[Triple] = set()
+        for page in batched(nodes, self.PAGE):
+            found = self.find_edges(page, self.outgoing_role)
+            for node, triples in zip(page, found, strict=True):
+                for source, target, edge in triples:
+                    oriented = (source, target, edge) if source == node else (target, source, edge)
+                    identity = (*self.canonical_pair(source, target), edge)
+                    if identity not in seen:
+                        seen.add(identity)
+                        yield oriented
 
     @property
-    @abstractmethod
-    def mentioned_nodes_ids(self) -> Sequence[int]:
-        """
-        CAUTION: This operation can be very expensive!
-        """
-        return self.unique_members_of_edges(self.edges)
+    def edges(self) -> EdgeView:
+        return EdgeView(self)
 
-    # endregion
+    def has_edge(self, source: int, target: int, key: int | None = None) -> bool:
+        between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
+        return any(key is None or edge == key for _, _, edge in between)
 
-    # region Random Reads
+    def number_of_edges(self, source: int | None = None, target: int | None = None) -> int:
+        if source is None or target is None:
+            return self.count_edges()
+        return len(self.stored_between([source]).get(self.canonical_pair(source, target), []))
 
-    @abstractmethod
-    def has_node(self, n) -> Optional[Node]:
-        """
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.has_node.html
-        """
-        return None
+    def size(self, weight: str | None = None) -> int | float:
+        if weight is None:
+            return self.number_of_edges()
+        return sum(attributes.get(weight, 1) for _, _, attributes in self.edges(data=True))
 
-    @abstractmethod
-    def has_edge(self, u, v, key=None) -> Sequence[Edge]:
-        """
-        The NetworkX API promises a `bool` return value, but we do differently.
-        We export all the edges that have given `u` and `v`. Any one of them can be set to `None`.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.has_edge.html
-        """
-        return None
+    def neighbors(self, node: int) -> Iterator[int]:
+        """The distinct vertices an edge leads to from `node`, in ascending order."""
+        if not self.has_node(node):
+            raise NetworkXternalError(f"The graph holds no vertex {node}")
+        return iter(sorted({target for _, target, _ in self.edge_triples(node)}))
 
-    @abstractmethod
-    def neighbors(self, n) -> Sequence[int]:
-        """
-        Returns IDs of nodes that have a shared edge with `v`.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.neighbors.html
-        """
-        result = self.unique_members_of_edges(self.has_edge(n, n))
-        result.discard(n)
-        return result
+    def nbunch_iter(self, nbunch: NodeBunch = None) -> Iterator[int]:
+        """The vertices of `nbunch` the graph actually holds, as NetworkX filters a bunch."""
+        if nbunch is None:
+            return self.scan_nodes()
+        nodes = nbunch if isinstance(nbunch, Iterable) else [nbunch]
+        return (node for node in nodes if self.has_node(node))
 
-    @abstractmethod
-    def successors(self, n) -> Sequence[int]:
-        """
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.successors.html
-        """
-        result = self.unique_members_of_edges(self.has_edge(n, None))
-        result.discard(n)
-        return result
+    @property
+    def adj(self) -> dict[int, Any]:
+        """A snapshot of the adjacency of every vertex; writing into it does not reach the store."""
+        return {node: self[node] for node in self}
 
-    @abstractmethod
-    def predecessors(self, n) -> Sequence[int]:
-        """
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.predecessors.html
-        """
-        result = self.unique_members_of_edges(self.has_edge(None, n))
-        result.discard(n)
-        return result
+    def adjacency(self) -> Iterator[tuple[int, dict[int, Any]]]:
+        """Yields every vertex with the attributes of the edges reaching its neighbours, page by page."""
+        for page in batched(self, self.PAGE):
+            for node in page:
+                yield node, self[node]
 
-    def __iter__(self) -> Sequence[Node]:
-        return self.nodes
+    def nodes_with_selfloops(self) -> Iterator[int]:
+        return (source for source, target, _ in self.edge_triples(None) if source == target)
 
-    def __contains__(self, n) -> bool:
-        return self.has_node(n) is not None
+    def selfloop_edges(self) -> Iterator[Triple]:
+        return (triple for triple in self.edge_triples(None) if triple[0] == triple[1])
 
-    def get_edge_data(self, u, v, key=None, default=None) -> dict:
-        """
-        This method isn't actively used and is designed for compatibility.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.MultiDiGraph.get_edge_data.html
-        """
-        e = self.has_edge(u, v, key)
-        if e is None:
+    def number_of_selfloops(self) -> int:
+        return sum(1 for _ in self.nodes_with_selfloops())
+
+    def neighbors_of_group(self, nodes: Iterable[int]) -> set[int]:
+        """The distinct vertices an edge leads to from any of `nodes`, minus `nodes` themselves."""
+        given = set(nodes)
+        return {target for _, target, _ in self.edge_triples(given)} - given
+
+    def get_edge_data(self, source: int, target: int, default: Any = None) -> Any:
+        between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
+        if not between:
             return default
-        return dict(
-            weight=e.weight,
-            label=e.label,
-            directed=e.directed,
-            **e.payload,
-        )
+        return self.read_documents(AttributeStore.EDGES, [between[0][2]])[0]
 
-    @abstractmethod
-    def neighbors_of_group(self, vs: Sequence[int]) -> Set[int]:
-        """Returns IDs of nodes that have one or more edges with members of `vs`."""
-        results = set()
-        for v in vs:
-            results = results.union(self.neighbors(v))
-        return results.difference(set(vs))
+    @property
+    def degree(self) -> DegreeView:
+        return DegreeView(self, Role.ANY)
 
-    @abstractmethod
-    def neighbors_of_neighbors(self, v: int, include_related=False) -> Set[int]:
-        related = self.neighbors(v)
-        related_to_related = self.neighbors_of_group(related.union({v}))
-        if include_related:
-            return related_to_related.union(related).difference({v})
+    def clear_edges(self) -> None:
+        """Removes every edge and its attributes, keeping the vertices."""
+        for page in batched(self, self.PAGE):
+            stored = [triple for triples in self.find_edges(page, Role.SOURCE) for triple in triples]
+            if stored:
+                sources, targets, identifiers = zip(*stored, strict=True)
+                self.drop_edges(sources, targets, identifiers)
+                self.drop_documents(AttributeStore.EDGES, identifiers)
+        self.next_edge_id = None
+
+    # endregion Edges
+
+    # region Attribute Maps
+
+    def get_node_attributes(self, name: str) -> dict[int, Any]:
+        return {node: found[name] for node, found in self.nodes(data=True) if name in found}
+
+    def set_node_attributes(self, values: Any, name: str | None = None) -> None:
+        """Merges `values` into vertices: one value for all of them, a value per vertex, or a document per vertex."""
+        if name is None:
+            nodes = list(values)
+            self.merge_documents(AttributeStore.NODES, nodes, [dict(values[node]) for node in nodes])
+        elif isinstance(values, Mapping):
+            nodes = list(values)
+            self.merge_documents(AttributeStore.NODES, nodes, [{name: values[node]} for node in nodes])
         else:
-            return related_to_related.difference(related).difference({v})
+            for page in batched(self, self.PAGE):
+                self.merge_documents(AttributeStore.NODES, page, [{name: values}])
 
-    # endregion
+    def edge_label(self, source: int, target: int, edge: int) -> tuple[int, ...]:
+        """How NetworkX names an edge: with its key in a multigraph, by its ends otherwise."""
+        return (source, target, edge) if self.MULTIGRAPH else (source, target)
 
-    # region Random Writes
+    def edge_identifier(self, label: tuple[int, ...]) -> int:
+        """The identifier an edge label addresses."""
+        if self.MULTIGRAPH:
+            return label[2]
+        between = self.stored_between([label[0]]).get(self.canonical_pair(label[0], label[1]), [])
+        if not between:
+            raise KeyError(label)
+        return between[0][2]
 
-    @abstractmethod
-    def add(self, obj, upsert=True) -> int:
-        """
-        Adds either an `Edge`, `Sequence[Edge]`, `Node` or `Sequence[Node]`.
-        Other arguments aren't allowed.
-        """
-        if is_sequence_of(obj, Edge) or is_sequence_of(obj, Node):
-            return sum([self.add(o, upsert=upsert) for o in obj])
+    def get_edge_attributes(self, name: str) -> dict[tuple[int, ...], Any]:
+        labelled: dict[tuple[int, ...], Any] = {}
+        for page in batched(self.edge_triples(None), self.PAGE):
+            attributes = self.read_documents(AttributeStore.EDGES, [edge for _, _, edge in page])
+            for (source, target, edge), found in zip(page, attributes, strict=True):
+                if name in found:
+                    labelled[self.edge_label(source, target, edge)] = found[name]
+        return labelled
+
+    def set_edge_attributes(self, values: Any, name: str | None = None) -> None:
+        """Merges `values` into edges: one value for all of them, a value per edge, or a document per edge."""
+        if name is None:
+            labels = list(values)
+            entries = [dict(values[label]) for label in labels]
+        elif isinstance(values, Mapping):
+            labels = list(values)
+            entries = [{name: values[label]} for label in labels]
         else:
-            return 0
+            for page in batched(self.edge_triples(None), self.PAGE):
+                self.merge_documents(AttributeStore.EDGES, [edge for _, _, edge in page], [{name: values}])
+            return
+        identifiers = [self.edge_identifier(label) for label in labels]
+        self.merge_documents(AttributeStore.EDGES, identifiers, entries)
 
-    @abstractmethod
-    def remove(self, obj) -> int:
-        """
-        Removes either an `Edge`, `Sequence[Edge]`, `Node` or `Sequence[Node]`.
-        Other arguments aren't allowed.
-        Can delete edges without a known ID, but it will work slower.
-        """
-        if is_sequence_of(obj, Edge) or is_sequence_of(obj, Node):
-            return sum(map(self.remove, obj))
-        else:
-            return 0
+    # endregion Attribute Maps
 
-    def remove_node(self, n) -> int:
-        """
-        Removes all the edges containing that node.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.Graph.remove.html
-        """
-        return self.remove(self.edges_related(n))
 
-    def add_node(self, _id, **attrs) -> bool:
-        """
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.Graph.add_node.html
-        """
-        return self.add(self.make_node(_id, **attrs))
+class BaseDiGraph(BaseGraph):
+    """A directed graph holding at most one edge from one vertex to another, as `networkx.DiGraph` does."""
 
-    def add_edge(self, first, second, **attrs) -> bool:
-        """
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.Graph.add_edge.html
-        """
-        return self.add(self.make_edge(first, second, **attrs))
+    DIRECTED = True
 
-    def add_missing_nodes(self) -> int:
-        """
-        Goes through all `Edge`s in DB and makes sure every node is present.
-        Expects, that all `Node` IDs will fit into RAM.
-        """
-        ids = self.mentioned_nodes_ids
-        registered_ids = {n._id for n in self.nodes}
-        ids = ids.difference(registered_ids)
-        nodes = [self.make_node(_id) for _id in ids]
-        return self.add(nodes, upsert=False)
+    def successors(self, node: int) -> Iterator[int]:
+        return self.neighbors(node)
 
-    # endregion
+    def has_successor(self, source: int, target: int) -> bool:
+        return self.has_edge(source, target)
 
-    # region Bulk
+    def has_predecessor(self, source: int, target: int) -> bool:
+        return self.has_edge(target, source)
 
-    @abstractmethod
-    def add_stream(self, stream, upsert=True) -> int:
-        """
-        Imports data from adjacency list CSV file. Row shape: `(first, second, weight)`.
-        Uses the `biggest_edge_id` to generate incremental IDs for new edges.
-        Doesn't guarantee edge uniqueness (for 2 given nodes) as `upsert_bulk` does.
-        """
-        count_edges_added = 0
-        chunk_len = type(self).__max_batch_size__
-        for es in chunks(stream, chunk_len):
-            count_edges_added += self.add(es, upsert=upsert)
-        self.add_missing_nodes()
-        return count_edges_added
+    @property
+    def succ(self) -> dict[int, Any]:
+        """A snapshot of every vertex's successors; writing into it does not reach the store."""
+        return self.adj
 
-    @abstractmethod
-    def clear(self):
-        """
-        Remove all nodes and edges from the graph.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.Graph.clear.html
-        """
-        pass
+    @property
+    def pred(self) -> dict[int, Any]:
+        """A snapshot of every vertex's predecessors; writing into it does not reach the store."""
+        return {node: {source: {} for source in self.predecessors(node)} for node in self}
 
-    @abstractmethod
-    def clear_edges(self):
-        """
-        Remove all edges from the graph, but keep the nodes.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.Graph.clear_edges.html
-        """
-        pass
+    def predecessors(self, node: int) -> Iterator[int]:
+        found = self.find_edges([node], Role.TARGET)
+        return iter(sorted({source for source, _, _ in found[0]}))
 
-    # endregion
+    @property
+    def in_degree(self) -> DegreeView:
+        return DegreeView(self, Role.TARGET)
 
-    # region Helpers
+    @property
+    def out_degree(self) -> DegreeView:
+        return DegreeView(self, Role.SOURCE)
 
-    def make_node_id(self, node_for_adding) -> int:
-        if isinstance(node_for_adding, int):
-            return node_for_adding
-        elif isinstance(node_for_adding, Node):
-            return node_for_adding._id
-        elif node_for_adding is None:
-            return -1
-        else:
-            return hash(node_for_adding)
 
-    def make_label(self, key) -> int:
-        if key is None:
-            return -1
-        elif isinstance(key, int):
-            return key
-        else:
-            return hash(key)
+class BaseMultiGraph(BaseGraph):
+    """An undirected graph holding any number of keyed edges between two vertices, as `networkx.MultiGraph` does."""
 
-    def make_node(self, node_for_adding, **attrs) -> Optional[Node]:
-        """
-        Parses NetworkX API arguments into a `Node` object.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.Graph.add_node.html
-        """
-        n = Node(
-            _id=self.make_node_id(node_for_adding),
-            weight=attrs.pop("weight", 1),
-            label=attrs.pop("label", 0),
-        )
-        n.payload = attrs
-        if not isinstance(node_for_adding, int):
-            n.payload["_id"] = node_for_adding
-        return n
+    MULTIGRAPH = True
 
-    def make_edge(self, first, second, key, **attrs) -> Optional[Edge]:
-        """
-        Parses NetworkX API arguments into an `Edge` object.
-        https://networkx.github.io/documentation/stable/reference/classes/generated/networkx.Graph.add_edge.html
-        """
-        first = self.make_node_id(first)
-        second = self.make_node_id(second)
-        label = self.make_label(key if key else attrs.pop("label", -1))
-        e = Edge(
-            _id=attrs.pop("_id", -1),
-            first=first,
-            second=second,
-            weight=attrs.pop("weight", 1),
-            label=label,
-            directed=attrs.pop("directed", self.directed),
-        )
-        if e._id < 0:
-            e._id = Edge.identify_by_members(first, second)
-        e.payload = dict(key=key, **attrs)
-        return e
+    def add_edge(self, source: int, target: int, key: int | None = None, **attributes: Any) -> int:
+        """Inserts one edge, or merges `attributes` into the one `key` names, and answers its key."""
+        return self.add_edges_from_arrays([source], [target], [key], **attributes)[0]
 
-    def unique_members_of_edges(self, es: Sequence[Edge]) -> Set[int]:
-        result = set()
-        for e in es:
-            result.add(e.first)
-            result.add(e.second)
-        return result
+    def remove_edge(self, source: int, target: int, key: int | None = None) -> None:
+        """Removes the edge `key` names, or the newest edge between the pair."""
+        if self.remove_edges_from_arrays([source], [target], [key]) == 0:
+            raise NetworkXternalError(f"The graph holds no edge {key} between {source} and {target}")
 
-    # endregion
+    def get_edge_data(self, source: int, target: int, key: int | None = None, default: Any = None) -> Any:
+        between = self.stored_between([source]).get(self.canonical_pair(source, target), [])
+        identifiers = [edge for _, _, edge in between if key is None or edge == key]
+        if not identifiers:
+            return default
+        attributes = self.read_documents(AttributeStore.EDGES, identifiers)
+        return attributes[0] if key is not None else dict(zip(identifiers, attributes, strict=True))
+
+
+class BaseMultiDiGraph(BaseMultiGraph, BaseDiGraph):
+    """A directed graph holding any number of keyed edges between two vertices, as `networkx.MultiDiGraph` does."""
+
+    DIRECTED = True
+    MULTIGRAPH = True
