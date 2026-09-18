@@ -47,6 +47,18 @@ def find_edge(graph: BaseGraph, sample: Sequence[tuple[int, int, float | None]])
     return len(sample)
 
 
+def find_edges_batch(graph: BaseGraph, sample: Sequence[tuple[int, int, float | None]]) -> int:
+    """One engine-side lookup for the whole sample of pairs, against the per-pair workload above."""
+    sources = [source for source, _, _ in sample]
+    targets = [target for _, target, _ in sample]
+    return sum(1 for _ in graph.find_pairs(sources, targets))
+
+
+def scan_edges(graph: BaseGraph, sample: Sequence[tuple[int, int, float | None]]) -> int:
+    """Streams the whole edge set once, which is the cost every whole-graph reader pays."""
+    return sum(1 for _ in graph.scan_edges())
+
+
 def find_edges_of_node(graph: BaseGraph, sample: Sequence[tuple[int, int, float | None]]) -> int:
     for source, _, _ in sample:
         list(graph.edge_triples(source))
@@ -107,6 +119,8 @@ def remove_edge(graph: BaseGraph, sample: Sequence[tuple[int, int, float | None]
 
 WORKLOADS = (
     Workload("Random Reads: Find Edge", Phase.READ, find_edge),
+    Workload("Random Reads: Find Edges Batch", Phase.READ, find_edges_batch),
+    Workload("Sequential Reads: Scan Edges", Phase.READ, scan_edges),
     Workload("Random Reads: Find Edges of Node", Phase.READ, find_edges_of_node),
     Workload("Random Reads: Find Neighbors", Phase.READ, find_neighbors),
     Workload("Random Reads: Count Degree", Phase.READ, count_degree),
