@@ -1,17 +1,25 @@
-"""Semi-external graph algorithms: vertex state stays in RAM, adjacency is pulled from the store page by page.
+"""Semi-external graph algorithms: vertex state stays in RAM, edges stream out of the store in stored order.
 
 NetworkX walks one vertex at a time, which costs one round-trip per step against an external store.
-Every traversal here streams the edges incident to a whole frontier instead, so a run costs a
-round-trip per page of edges rather than per vertex, and holds vertex state and one page of rows.
+Every algorithm here is a scatter over an edge stream instead, so a sweep costs one sequential pass over
+the edges and holds a fixed number of bytes per vertex — two `array` slots rather than a dict of floats.
 """
 
 from __future__ import annotations
 
 import random
+from array import array
 from collections.abc import Iterable, Iterator, Sequence
+from enum import StrEnum
 from itertools import batched
 
-from networkxternal.base_api import AttributeStore, BaseGraph, DegreeView, Role
+from networkxternal.base_api import AttributeStore, BaseGraph, DegreeView, Role, Triple
+
+BOTTOM_UP_FRACTION = 0.1
+"""The share of the vertex count a frontier must pass before a layer is found by scanning every edge instead."""
+
+
+# region Edge Streams
 
 
 def adjacency(graph: BaseGraph, nodes: Iterable[int], role: Role) -> Iterator[tuple[int, int, int]]:
@@ -20,21 +28,49 @@ def adjacency(graph: BaseGraph, nodes: Iterable[int], role: Role) -> Iterator[tu
         yield node, (target if source == node else source), edge
 
 
-def weighted_adjacency(
-    graph: BaseGraph, nodes: Iterable[int], role: Role, weight: str | None
-) -> Iterator[tuple[int, int, float]]:
-    """Yields `(vertex, neighbour, weight)` for every incident edge, reading one page of documents at a time.
+def scan_unit_edges(graph: BaseGraph) -> Iterator[tuple[int, int, float]]:
+    """Yields `(source, target, 1.0)` for every stored edge, reading no attribute document at all."""
+    for source, target, _ in graph.scan_edges():
+        yield source, target, 1.0
 
-    With `weight` unset every edge counts as one, and no attribute document is read at all.
-    """
-    for page in batched(graph.adjacent_edges(list(nodes), role), graph.PAGE):
-        if weight is None:
-            for node, (source, target, _) in page:
-                yield node, (target if source == node else source), 1.0
-            continue
-        attributes = graph.read_documents(AttributeStore.EDGES, [edge for _, (_, _, edge) in page])
-        for (node, (source, target, _)), found in zip(page, attributes, strict=True):
-            yield node, (target if source == node else source), float(found.get(weight, 1))
+
+def scan_weighted_edges(graph: BaseGraph, weight: str) -> Iterator[tuple[int, int, float]]:
+    """Yields `(source, target, weight)` for every stored edge, holding one page of documents at a time."""
+    for page in batched(graph.scan_edges(), graph.PAGE):
+        documents = graph.read_documents(AttributeStore.EDGES, [edge for _, _, edge in page])
+        for (source, target, _), found in zip(page, documents, strict=True):
+            yield source, target, float(found.get(weight, 1))
+
+
+def mirrored(stream: Iterable[tuple[int, int, float]]) -> Iterator[tuple[int, int, float]]:
+    """Yields every edge of a stream in both orientations, a self-loop once."""
+    for source, target, held in stream:
+        yield source, target, held
+        if source != target:
+            yield target, source, held
+
+
+def scan_arcs(graph: BaseGraph, weight: str | None) -> Iterator[tuple[int, int, float]]:
+    """Every edge as an arc pushing mass, mirrored unless the graph is directed, chosen before the sweep."""
+    stream = scan_unit_edges(graph) if weight is None else scan_weighted_edges(graph, weight)
+    return stream if graph.is_directed() else mirrored(stream)
+
+
+# endregion Edge Streams
+
+# region Traversal
+
+
+def expand_top_down(graph: BaseGraph, frontier: set[int], visited: set[int]) -> set[int]:
+    """The unvisited neighbours of a small frontier, pulled by adjacency, one page of rows at a time."""
+    return {
+        neighbour for _, neighbour, _ in adjacency(graph, frontier, graph.outgoing_role) if neighbour not in visited
+    }
+
+
+def expand_bottom_up(graph: BaseGraph, frontier: set[int], visited: set[int]) -> set[int]:
+    """The unvisited neighbours of a wide frontier, found in one sequential pass over every edge."""
+    return {target for source, target, _ in scan_arcs(graph, None) if source in frontier and target not in visited}
 
 
 def breadth_first_layers(
@@ -42,21 +78,23 @@ def breadth_first_layers(
     sources: int | Iterable[int],
     cutoff: int | None = None,
 ) -> Iterator[set[int]]:
-    """Yields the vertices at distance 0, 1, 2 … from `sources`, one round-trip per layer.
+    """Yields the vertices at distance 0, 1, 2 … from `sources`, one round-trip page per layer.
 
-    Holds the visited set and the current frontier, which is proportional to the reached component.
+    Holds the visited set and the current frontier, both proportional to the reached component, and
+    switches from pulling a frontier's adjacency to scanning every edge once the frontier passes
+    `BOTTOM_UP_FRACTION` of the vertex count.
     """
     frontier = {sources} if isinstance(sources, int) else set(sources)
     visited = set(frontier)
+    threshold = BOTTOM_UP_FRACTION * graph.number_of_nodes()
     depth = 0
     while frontier:
         yield frontier
         depth += 1
         if cutoff is not None and depth > cutoff:
             return
-        reached = {
-            neighbour for _, neighbour, _ in adjacency(graph, frontier, graph.outgoing_role) if neighbour not in visited
-        }
+        expand = expand_bottom_up if len(frontier) > threshold else expand_top_down
+        reached = expand(graph, frontier, visited)
         visited |= reached
         frontier = reached
 
@@ -73,33 +111,93 @@ def shortest_path_lengths(
     return lengths
 
 
-def neighbors_of_neighbors(graph: BaseGraph, node: int, include_neighbors: bool = False) -> set[int]:
-    """The vertices two steps from `node`, with or without the ones a single step reaches."""
+class Reach(StrEnum):
+    """Which vertices a two-step lookup reports."""
+
+    SECOND_STEP = "second-step"
+    """Only the vertices exactly two steps away."""
+
+    BOTH_STEPS = "both-steps"
+    """The vertices one or two steps away."""
+
+
+def neighbors_of_neighbors(graph: BaseGraph, node: int, reach: Reach = Reach.SECOND_STEP) -> set[int]:
+    """The vertices two steps from `node`, and the ones a single step reaches when `reach` asks for them."""
     layers = list(breadth_first_layers(graph, node, cutoff=2))
-    reached = layers[2] if len(layers) > 2 else set()
-    if include_neighbors and len(layers) > 1:
-        reached |= layers[1]
-    return reached - {node}
+    wanted = layers[1:3] if reach is Reach.BOTH_STEPS else layers[2:3]
+    return set().union(*wanted) - {node} if wanted else set()
 
 
-def connected_components(graph: BaseGraph, iterations: int = 1024) -> dict[int, int]:
+# endregion Traversal
+
+# region Components
+
+
+def find_root(parents: array, index: int) -> int:
+    """The representative of the set holding `index`, compressing the path walked to reach it."""
+    root = index
+    while parents[root] != root:
+        root = parents[root]
+    while parents[index] != root:
+        parents[index], index = root, parents[index]
+    return root
+
+
+def join_sets(parents: array, depths: array, left: int, right: int) -> None:
+    """Joins the two sets holding `left` and `right`, hanging the shallower tree under the deeper one."""
+    left, right = find_root(parents, left), find_root(parents, right)
+    if left == right:
+        return
+    if depths[left] < depths[right]:
+        left, right = right, left
+    parents[right] = left
+    if depths[left] == depths[right]:
+        depths[left] += 1
+
+
+def connected_components(graph: BaseGraph) -> dict[int, int]:
     """The component every vertex belongs to, named by the smallest vertex in it.
 
-    Label propagation over the whole vertex set, one sweep per round-trip page, until labels settle.
-    Holds one label per vertex, never an adjacency list of the graph, and raises rather than reporting
-    labels that have not settled within `iterations` sweeps.
+    Union-find over one sequential pass of the edge stream, which converges in that single pass however
+    long the paths are. Holds three 8-byte slots per vertex and one page of edge rows, never an adjacency
+    list and never a second sweep.
     """
-    labels = {node: node for node in graph.scan_nodes()}
-    nodes = list(labels)
-    for _ in range(iterations):
-        changed = False
-        for node, neighbour, _ in adjacency(graph, nodes, Role.ANY):
-            if neighbour in labels and labels[neighbour] < labels[node]:
-                labels[node] = labels[neighbour]
-                changed = True
-        if not changed:
-            return labels
-    raise RuntimeError(f"Labels did not settle within {iterations} sweeps")
+    order = relabel_dense(list(graph.scan_nodes()))
+    count = len(order)
+    names = array("q", order)
+    parents = array("q", range(count))
+    depths = array("q", [0]) * count
+    for source, target, _ in graph.scan_edges():
+        join_sets(parents, depths, order[source], order[target])
+    smallest = array("q", names)
+    for index in range(count):
+        root = find_root(parents, index)
+        if names[index] < smallest[root]:
+            smallest[root] = names[index]
+    return {names[index]: smallest[find_root(parents, index)] for index in range(count)}
+
+
+# endregion Components
+
+# region PageRank
+
+
+def outgoing_scale(graph: BaseGraph, order: dict[int, int], weight: str | None) -> array:
+    """The reciprocal of every vertex's outgoing weight, zero where it has none, in one edge pass."""
+    totals = array("d", [0.0]) * len(order)
+    for source, _, held in scan_arcs(graph, weight):
+        totals[order[source]] += held
+    return array("d", [1.0 / total if total else 0.0 for total in totals])
+
+
+def settle_ranks(ranks: array, pushed: array, damping: float, leaked: float) -> float:
+    """Folds a sweep's pushed mass back into the ranks and returns how far they moved."""
+    drift = 0.0
+    for index, mass in enumerate(pushed):
+        updated = damping * mass + leaked
+        drift += abs(updated - ranks[index])
+        ranks[index] = updated
+    return drift
 
 
 def pagerank(
@@ -109,77 +207,168 @@ def pagerank(
     tolerance: float = 1e-6,
     weight: str | None = "weight",
 ) -> dict[int, float]:
-    """The PageRank of every vertex, pushed along out-edges, one round-trip page per sweep.
+    """The PageRank of every vertex, scattered along out-edges, one sequential edge pass per sweep.
 
-    Holds two floats per vertex; the edges themselves are never materialized. With `weight` unset
+    Holds three 8-byte slots and one index entry per vertex, and one page of edge rows; a weighted run
+    also holds one page of attribute documents, which is where its weights come from. With `weight` unset
     every edge carries the same mass, which is what NetworkX calls `weight=None`.
     """
-    ranks = {node: 0.0 for node in graph.scan_nodes()}
-    if not ranks:
-        return ranks
-    share = 1.0 / len(ranks)
-    ranks = dict.fromkeys(ranks, share)
-    nodes = list(ranks)
+    order = relabel_dense(list(graph.scan_nodes()))
+    count = len(order)
+    if not count:
+        return {}
+    share = 1.0 / count
+    ranks = array("d", [share]) * count
+    scale = outgoing_scale(graph, order, weight)
     for _ in range(iterations):
-        pushed = dict.fromkeys(ranks, 0.0)
-        totals = dict.fromkeys(ranks, 0.0)
-        for node, _, held in weighted_adjacency(graph, nodes, graph.outgoing_role, weight):
-            totals[node] += held
-        dangling = sum(ranks[node] for node, total in totals.items() if not total)
-        for node, neighbour, held in weighted_adjacency(graph, nodes, graph.outgoing_role, weight):
-            if totals[node] and neighbour in pushed:
-                pushed[neighbour] += ranks[node] * held / totals[node]
+        pushed = array("d", [0.0]) * count
+        for source, target, held in scan_arcs(graph, weight):
+            position = order[source]
+            pushed[order[target]] += ranks[position] * held * scale[position]
+        dangling = sum(rank for rank, spread in zip(ranks, scale, strict=True) if not spread)
         leaked = damping * dangling * share + (1.0 - damping) * share
-        updated = {node: damping * mass + leaked for node, mass in pushed.items()}
-        drift = sum(abs(updated[node] - ranks[node]) for node in ranks)
-        ranks = updated
-        if drift < len(ranks) * tolerance:
+        if settle_ranks(ranks, pushed, damping, leaked) < count * tolerance:
             break
-    return ranks
+    return {node: ranks[index] for node, index in order.items()}
+
+
+# endregion PageRank
+
+# region Peeling
+
+
+def total_degrees(graph: BaseGraph, order: dict[int, int]) -> array:
+    """How many edge ends every vertex holds, counted in one sequential pass over the edge stream."""
+    degrees = array("q", [0]) * len(order)
+    for source, target, _ in graph.scan_edges():
+        degrees[order[source]] += 1
+        degrees[order[target]] += 1
+    return degrees
+
+
+def peel_below(degrees: array, alive: bytearray, cores: array, level: int) -> bytearray:
+    """Marks every surviving vertex at or under `level` as peeled at that level, and reports which."""
+    peeled = bytearray(len(alive))
+    for index, degree in enumerate(degrees):
+        if not alive[index] or degree > level:
+            continue
+        peeled[index] = 1
+        alive[index] = 0
+        cores[index] = level
+    return peeled
+
+
+def lower_across_peeled(graph: BaseGraph, order: dict[int, int], degrees: array, peeled: bytearray) -> None:
+    """Lowers the degree of every vertex reached from one peeled this round, in one edge pass."""
+    for source, target, _ in graph.scan_edges():
+        left, right = order[source], order[target]
+        degrees[right] -= peeled[left]
+        degrees[left] -= peeled[right]
 
 
 def core_numbers(graph: BaseGraph) -> dict[int, int]:
     """The largest `k` whose k-core holds every vertex, by peeling the lowest degree first.
 
-    Holds one degree per vertex and pulls the neighbourhood of a peeled vertex only.
+    Holds one degree, one core number and one liveness byte per vertex, and spends one sequential edge
+    pass per peeling round — never the neighbourhood of a peeled vertex, which is what the store would
+    have to seek for.
     """
-    remaining = {node: degree for node, degree in graph.degree}
-    cores: dict[int, int] = {}
+    order = relabel_dense(list(graph.scan_nodes()))
+    count = len(order)
+    degrees = total_degrees(graph, order)
+    cores = array("q", [0]) * count
+    alive = bytearray(b"\x01") * count
     level = 0
+    remaining = count
     while remaining:
-        level = max(level, min(remaining.values()))
-        peeled = [node for node, degree in remaining.items() if degree <= level]
-        for node in peeled:
-            cores[node] = level
-            del remaining[node]
-        for _, neighbour, _ in adjacency(graph, peeled, Role.ANY):
-            if neighbour in remaining:
-                remaining[neighbour] -= 1
-    return cores
+        level = max(level, min(degrees[index] for index in range(count) if alive[index]))
+        peeled = peel_below(degrees, alive, cores, level)
+        remaining -= sum(peeled)
+        lower_across_peeled(graph, order, degrees, peeled)
+    return {node: cores[index] for node, index in order.items()}
+
+
+# endregion Peeling
+
+# region Triangles
+
+
+def compact_run(neighbours: array, start: int, stop: int) -> int:
+    """Sorts one vertex's neighbours in place, dropping repeats, and reports where its run now ends."""
+    unique = sorted(set(neighbours[start:stop]))
+    neighbours[start : start + len(unique)] = array("q", unique)
+    return start + len(unique)
+
+
+def sorted_adjacency(graph: BaseGraph, order: dict[int, int]) -> tuple[array, array, array]:
+    """Every vertex's neighbours as one sorted run, packed at 8 bytes an edge end, in two edge passes."""
+    count = len(order)
+    starts = array("q", [0]) * (count + 1)
+    for source, target, _ in graph.scan_edges():
+        starts[order[source] + 1] += source != target
+        starts[order[target] + 1] += source != target
+    for index in range(count):
+        starts[index + 1] += starts[index]
+    neighbours = array("q", [0]) * starts[count]
+    cursors = array("q", starts[:count])
+    for source, target, _ in graph.scan_edges():
+        if source == target:
+            continue
+        left, right = order[source], order[target]
+        neighbours[cursors[left]] = right
+        neighbours[cursors[right]] = left
+        cursors[left] += 1
+        cursors[right] += 1
+    ends = array("q", [compact_run(neighbours, starts[index], cursors[index]) for index in range(count)])
+    return starts, ends, neighbours
+
+
+def shared_count(left: Sequence[int], right: Sequence[int]) -> int:
+    """How many vertices two sorted adjacency runs share, by walking each of them once."""
+    left_index = right_index = shared = 0
+    while left_index < len(left) and right_index < len(right):
+        if left[left_index] == right[right_index]:
+            shared += 1
+            left_index += 1
+            right_index += 1
+        elif left[left_index] < right[right_index]:
+            left_index += 1
+        else:
+            right_index += 1
+    return shared
+
+
+def accumulate_shared(starts: array, ends: array, neighbours: array, counts: array) -> None:
+    """Adds to both ends of every edge how many neighbours the two ends share, run against sorted run."""
+    runs = memoryview(neighbours)
+    for index in range(len(counts)):
+        run = runs[starts[index] : ends[index]]
+        for position in range(starts[index], ends[index]):
+            other = neighbours[position]
+            if other < index:
+                continue
+            shared = shared_count(run, runs[starts[other] : ends[other]])
+            counts[index] += shared
+            counts[other] += shared
 
 
 def triangle_counts(graph: BaseGraph, nodes: Iterable[int] | None = None) -> dict[int, int]:
-    """How many triangles every vertex takes part in, by intersecting neighbourhoods a page at a time.
+    """How many triangles every vertex takes part in, by intersecting two sorted adjacency runs at a time.
 
-    Holds the neighbourhood of the wanted vertices and of the vertices one step away from them.
+    Holds one packed adjacency of 8 bytes per edge end plus three 8-byte slots per vertex, built in two
+    sequential edge passes; a self-loop and a repeated edge are dropped as the runs are sorted.
     """
-    wanted = set(graph.scan_nodes()) if nodes is None else set(nodes)
-    neighbourhoods: dict[int, set[int]] = {node: set() for node in wanted}
-    for node, neighbour, _ in adjacency(graph, list(wanted), Role.ANY):
-        if neighbour != node:
-            neighbourhoods[node].add(neighbour)
-    reached = {neighbour for neighbours in neighbourhoods.values() for neighbour in neighbours}
-    missing = [neighbour for neighbour in reached if neighbour not in neighbourhoods]
-    for node in missing:
-        neighbourhoods[node] = set()
-    for node, neighbour, _ in adjacency(graph, missing, Role.ANY):
-        if neighbour != node:
-            neighbourhoods[node].add(neighbour)
-    return {
-        node: sum(len(neighbours & neighbourhoods[neighbour]) for neighbour in neighbours) // 2
-        for node, neighbours in neighbourhoods.items()
-        if node in wanted
-    }
+    order = relabel_dense(list(graph.scan_nodes()))
+    starts, ends, neighbours = sorted_adjacency(graph, order)
+    counts = array("q", [0]) * len(order)
+    accumulate_shared(starts, ends, neighbours, counts)
+    wanted = order if nodes is None else set(nodes)
+    return {node: counts[order[node]] // 2 for node in wanted}
+
+
+# endregion Triangles
+
+# region Sampling
 
 
 def degree_histogram(graph: BaseGraph, role: Role = Role.ANY) -> dict[int, int]:
@@ -204,11 +393,11 @@ def sample_nodes(graph: BaseGraph, count: int, seed: int | None = None) -> list[
     return reservoir
 
 
-def sample_edges(graph: BaseGraph, count: int, seed: int | None = None) -> list[tuple[int, int, int]]:
-    """A uniform sample of `count` edges, reservoir-sampled over one pass of the edge scan."""
+def sample_edges(graph: BaseGraph, count: int, seed: int | None = None) -> list[Triple]:
+    """A uniform sample of `count` edges, reservoir-sampled over one pass of the edge stream."""
     generator = random.Random(seed)
-    reservoir: list[tuple[int, int, int]] = []
-    for seen, triple in enumerate(graph.edge_triples(None)):
+    reservoir: list[Triple] = []
+    for seen, triple in enumerate(graph.scan_edges()):
         if len(reservoir) < count:
             reservoir.append(triple)
             continue
@@ -221,3 +410,6 @@ def sample_edges(graph: BaseGraph, count: int, seed: int | None = None) -> list[
 def relabel_dense(nodes: Sequence[int]) -> dict[int, int]:
     """A dense 0-based numbering of sparse vertex identifiers, for matrices and adjacency arrays."""
     return {node: index for index, node in enumerate(nodes)}
+
+
+# endregion Sampling

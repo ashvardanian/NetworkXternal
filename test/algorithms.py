@@ -79,3 +79,50 @@ def test_samples_stay_inside_the_graph(populated):
     edges = sample_edges(populated, 3, seed=42)
     assert len(edges) == 3
     assert all(populated.has_edge(source, target) for source, target, _ in edges)
+
+
+def test_connected_components_across_a_long_path(empty):
+    """A path longer than any label-propagation sweep cap, which union-find settles in one edge pass."""
+    if empty.is_directed():
+        pytest.skip("The reference graph is undirected")
+    length = 2048
+    empty.add_edges_from([(node, node + 1) for node in range(length)])
+    empty.add_node(10_000)
+    labels = connected_components(empty)
+    assert labels[length] == 0
+    assert labels[0] == 0
+    assert labels[10_000] == 10_000
+    assert len(set(labels.values())) == 2
+
+
+def test_pagerank_unweighted(populated, undirected):
+    graph = simple(populated)
+    ranks = pagerank(graph, iterations=100, tolerance=1e-11, weight=None)
+    held = networkx.pagerank(undirected, tol=1e-10, max_iter=1000, weight=None)
+    for node, rank in held.items():
+        assert ranks[node] == pytest.approx(rank, abs=1e-6)
+
+
+def test_pagerank_weighted(populated, undirected):
+    graph = simple(populated)
+    ranks = pagerank(graph, iterations=100, tolerance=1e-11, weight="weight")
+    held = networkx.pagerank(undirected, tol=1e-10, max_iter=1000, weight="weight")
+    for node, rank in held.items():
+        assert ranks[node] == pytest.approx(rank, abs=1e-6)
+
+
+def test_core_numbers_on_a_denser_graph(empty):
+    if empty.is_directed() or empty.is_multigraph():
+        pytest.skip("The reference graph is a simple undirected one")
+    edges = [(1, 2), (1, 3), (2, 3), (3, 4), (4, 5), (4, 6), (5, 6), (4, 3), (6, 1), (7, 1)]
+    empty.add_edges_from(edges)
+    held = networkx.Graph(edges)
+    assert core_numbers(empty) == networkx.core_number(held)
+    assert triangle_counts(empty) == networkx.triangles(held)
+
+
+def test_triangle_counts_of_a_subset(populated, undirected):
+    graph = simple(populated)
+    assert triangle_counts(graph, [1, 3, 4]) == {
+        node: count for node, count in networkx.triangles(undirected).items() if node in {1, 3, 4}
+    }
