@@ -12,10 +12,30 @@ from array import array
 from bisect import bisect_left
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from enum import StrEnum
 from itertools import batched, compress, islice
 
 from networkxternal.base_api import BaseGraph, DegreeView, Role, Triple
+
+
+@dataclass(frozen=True)
+class Bounds:
+    """What an algorithm holds and how often it reads the graph, as a contract `test/bounds.py` enforces.
+
+    The bytes are of vertex state in the Python heap, measured on a store whose own buffers `tracemalloc`
+    cannot see, and they are what the growth between two graph sizes is checked against.
+    """
+
+    retained_per_vertex: int
+    """What the answer itself costs per vertex once the call returns, which is usually a dict entry."""
+
+    working_per_vertex: int
+    """What the walk holds per vertex while it runs, in arrays, and gives back when it returns."""
+
+    passes: str
+    """How often the edge set is read: `one`, `per sweep`, `per layer`, `per round`, or `two`."""
+
 
 BOTTOM_UP_FRACTION = 0.1
 """The share of the vertex count a frontier must pass before a layer is found by scanning every edge instead."""
@@ -172,11 +192,13 @@ def join_sets(parents: array, depths: array, left: int, right: int) -> None:
 def connected_components(graph: BaseGraph) -> dict[int, int]:
     """The component every vertex belongs to, named by the smallest vertex in it.
 
+    Bound: 24 bytes per vertex while it runs, 68 per vertex in the answer, one pass over the edges.
+
     Union-find over one sequential pass of the edge stream, which converges in that single pass however
     long the paths are. Holds three 8-byte slots per vertex and one page of edge rows, never an adjacency
     list and never a second sweep.
     """
-    order = relabel_dense(list(graph.scan_nodes()))
+    order = DenseIndex(graph.scan_nodes())
     count = len(order)
     names = array("q", order)
     parents = array("q", range(count))
@@ -223,11 +245,13 @@ def pagerank(
 ) -> dict[int, float]:
     """The PageRank of every vertex, scattered along out-edges, one sequential edge pass per sweep.
 
+    Bound: 32 bytes per vertex while it runs, 92 per vertex in the answer, one pass per sweep.
+
     Holds three 8-byte slots and one index entry per vertex, and one page of edge rows; a weighted run
     also holds one page of attribute documents, which is where its weights come from. With `weight` unset
     every edge carries the same mass, which is what NetworkX calls `weight=None`.
     """
-    order = relabel_dense(list(graph.scan_nodes()))
+    order = DenseIndex(graph.scan_nodes())
     count = len(order)
     if not count:
         return {}
@@ -293,11 +317,13 @@ def lower_across_peeled(graph: BaseGraph, order: dict[int, int], degrees: array,
 def core_numbers(graph: BaseGraph) -> dict[int, int]:
     """The largest `k` whose k-core holds every vertex, by peeling the lowest degree first.
 
+    Bound: 25 bytes per vertex while it runs, 68 per vertex in the answer, one pass per peeling round.
+
     Holds one degree, one core number and one liveness byte per vertex, and spends one sequential edge
     pass per peeling round — never the neighbourhood of a peeled vertex, which is what the store would
     have to seek for. Self-loops carry no vertex into a core and are skipped, as NetworkX has it.
     """
-    order = relabel_dense(list(graph.scan_nodes()))
+    order = DenseIndex(graph.scan_nodes())
     count = len(order)
     degrees = total_degrees(graph, order)
     cores = array("q", [0]) * count
@@ -383,7 +409,7 @@ def triangle_counts(graph: BaseGraph, nodes: Iterable[int] | None = None) -> dic
     Holds one packed adjacency of 8 bytes per edge end plus three 8-byte slots per vertex, built in two
     sequential edge passes; a self-loop and a repeated edge are dropped as the runs are sorted.
     """
-    order = relabel_dense(list(graph.scan_nodes()))
+    order = DenseIndex(graph.scan_nodes())
     starts, ends, neighbours = sorted_adjacency(graph, order)
     counts = array("q", [0]) * len(order)
     accumulate_shared(starts, ends, neighbours, counts)
@@ -392,6 +418,28 @@ def triangle_counts(graph: BaseGraph, nodes: Iterable[int] | None = None) -> dic
 
 
 # endregion Triangles
+
+# region Bounds
+
+BOUNDS = {
+    "breadth_first_layers": Bounds(retained_per_vertex=0, working_per_vertex=32, passes="per layer"),
+    "shortest_path_lengths": Bounds(retained_per_vertex=68, working_per_vertex=32, passes="per layer"),
+    "connected_components": Bounds(retained_per_vertex=68, working_per_vertex=24, passes="one"),
+    "pagerank": Bounds(retained_per_vertex=92, working_per_vertex=32, passes="per sweep"),
+    "core_numbers": Bounds(retained_per_vertex=68, working_per_vertex=25, passes="per round"),
+    "triangle_counts": Bounds(retained_per_vertex=68, working_per_vertex=24, passes="two"),
+    "degree_histogram": Bounds(retained_per_vertex=0, working_per_vertex=0, passes="one"),
+    "sample_nodes": Bounds(retained_per_vertex=0, working_per_vertex=0, passes="one"),
+    "sample_edges": Bounds(retained_per_vertex=0, working_per_vertex=0, passes="one"),
+}
+"""What each algorithm holds and how often it reads the graph, which `test/bounds.py` measures.
+
+An answer keyed by vertex costs about seventy bytes per entry, which is three times the arrays the
+walk itself uses — so on a graph too large for that, ask for the array form rather than the mapping.
+"""
+
+# endregion Bounds
+
 
 # region Sampling
 
@@ -426,9 +474,33 @@ def sample_edges(graph: BaseGraph, count: int, seed: int | None = None) -> list[
     return reservoir(graph.scan_edges(), count, seed)
 
 
-def relabel_dense(nodes: Sequence[int]) -> dict[int, int]:
-    """A dense 0-based numbering of sparse vertex identifiers, for matrices and adjacency arrays."""
-    return {node: index for index, node in enumerate(nodes)}
+class DenseIndex:
+    """A dense 0-based numbering of sparse vertex identifiers, at eight bytes per vertex.
+
+    Every backend scans its vertices in key order, so the identifiers are already sorted and the
+    position of one is a binary search. A dict would answer in constant time and cost about a hundred
+    bytes per vertex, which is four times the state every algorithm here holds for its own results.
+    """
+
+    def __init__(self, nodes: Iterable[int]) -> None:
+        self.nodes = array("q", nodes)
+        """Every vertex identifier in key order, which is the order the store answered in."""
+
+    def __len__(self) -> int:
+        return len(self.nodes)
+
+    def __iter__(self) -> Iterator[int]:
+        return iter(self.nodes)
+
+    def __getitem__(self, node: int) -> int:
+        position = bisect_left(self.nodes, node)
+        if position == len(self.nodes) or self.nodes[position] != node:
+            raise KeyError(node)
+        return position
+
+    def items(self) -> Iterator[tuple[int, int]]:
+        """Every vertex with its position, in key order."""
+        return ((node, index) for index, node in enumerate(self.nodes))
 
 
 # endregion Sampling

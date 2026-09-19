@@ -317,6 +317,10 @@ class BaseGraph(ABC):
         """
         return [numeric_weight(found.get(name)) for found in self.read_documents(AttributeStore.EDGES, edges)]
 
+    def count_nodes(self) -> int:
+        """How many vertices the graph holds, which is `number_of_nodes` under the name its sibling has."""
+        return self.number_of_nodes()
+
     def count_edges(self) -> int:
         """How many edges the graph holds; a store that can count them outright overrides this walk."""
         return sum(degree for _, degree in DegreeView(self, Role.SOURCE))
