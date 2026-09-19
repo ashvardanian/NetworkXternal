@@ -11,6 +11,9 @@ services:
     memswap_limit: 1g
     cpus: 2
     command: ["--wiredTigerCacheSizeGB", "0.5"]
+    # A suite that opens a client per graph exhausts the default 1024 descriptors long before the cache.
+    ulimits:
+      nofile: { soft: 64000, hard: 64000 }
     tmpfs: ["/data/db:size=2g"]
 
   postgres:

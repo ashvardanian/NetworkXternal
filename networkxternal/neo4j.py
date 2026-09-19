@@ -60,6 +60,12 @@ class Neo4JGraph(BaseGraph):
             session.run(f"CREATE INDEX `{name}_id` IF NOT EXISTS FOR (v:{self.vertex}) ON (v.id)")
             session.run(f"CREATE INDEX `{name}_edge` IF NOT EXISTS FOR ()-[e:{self.edge}]-() ON (e.id)")
 
+    def _loops(self, role: Role) -> str:
+        """The second end a self-loop contributes to an undirected degree, which the pattern finds once."""
+        if role is not Role.ANY:
+            return "0"
+        return f"COUNT {{ MATCH (v:{self.vertex} {{id: key}})-[e:{self.edge}]-(v) }}"
+
     def _pattern(self, role: Role) -> str:
         """The match pattern that binds `v` to the given vertex in that role."""
         if role is Role.SOURCE:
@@ -164,7 +170,7 @@ class Neo4JGraph(BaseGraph):
             return []
         query = f"""
         UNWIND $keys AS key
-        RETURN key AS key, COUNT {{ MATCH {self._pattern(role)} }} AS degree
+        RETURN key AS key, COUNT {{ MATCH {self._pattern(role)} }} + {self._loops(role)} AS degree
         """
         with self.driver.session() as session:
             counts = {record["key"]: record["degree"] for record in session.run(query, keys=keys)}

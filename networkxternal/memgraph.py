@@ -26,13 +26,16 @@ class MemgraphGraph(Neo4JGraph):
             session.run(f"CREATE EDGE INDEX ON :{self.edge}(id)")
 
     def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
+        """An aggregation rather than a subquery, and a self-loop counted at both of its ends."""
         keys = list(nodes)
         if not keys:
             return []
+        # A self-loop is found once by an undirected pattern and contributes two ends; a directed role counts it once.
+        loops = " + count(CASE WHEN startNode(e) = endNode(e) THEN 1 END)" if role is Role.ANY else ""
         query = f"""
         UNWIND $keys AS key
         MATCH {self._pattern(role)}
-        RETURN key AS key, count(e) AS degree
+        RETURN key AS key, count(e){loops} AS degree
         """
         with self.driver.session() as session:
             counts = {record["key"]: record["degree"] for record in session.run(query, keys=keys)}

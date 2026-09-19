@@ -54,14 +54,21 @@ def test_connected_components(populated, undirected):
     assert {frozenset(component) for component in grouped.values()} == held
 
 
+def without_loops(held):
+    """The reference graph without its self-loop, which NetworkX refuses in these two algorithms."""
+    stripped = held.copy()
+    stripped.remove_edges_from(networkx.selfloop_edges(stripped))
+    return stripped
+
+
 def test_core_numbers(populated, undirected):
     graph = simple(populated)
-    assert core_numbers(graph) == networkx.core_number(undirected)
+    assert core_numbers(graph) == networkx.core_number(without_loops(undirected))
 
 
 def test_triangle_counts(populated, undirected):
     graph = simple(populated)
-    assert triangle_counts(graph) == networkx.triangles(undirected)
+    assert triangle_counts(graph) == networkx.triangles(without_loops(undirected))
 
 
 def test_pagerank(populated, undirected):
@@ -124,5 +131,5 @@ def test_core_numbers_on_a_denser_graph(empty):
 def test_triangle_counts_of_a_subset(populated, undirected):
     graph = simple(populated)
     assert triangle_counts(graph, [1, 3, 4]) == {
-        node: count for node, count in networkx.triangles(undirected).items() if node in {1, 3, 4}
+        node: count for node, count in networkx.triangles(without_loops(undirected)).items() if node in {1, 3, 4}
     }

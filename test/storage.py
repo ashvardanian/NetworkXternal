@@ -96,6 +96,22 @@ def test_find_pairs_skips_a_pair_that_holds_nothing(populated):
     assert {position for position, _ in found} == {1, 2}
 
 
+def test_a_directed_self_loop_counts_once_in_each_direction(populated):
+    """A directed self-loop is one out-edge and one in-edge, as NetworkX has it."""
+    if not populated.is_directed():
+        pytest.skip("An undirected self-loop counts twice in one degree instead")
+    assert populated.degrees([3], Role.SOURCE)[0] == populated.out_degree[3]
+    assert populated.out_degree[3] == 2
+    assert populated.in_degree[3] == 3
+
+
+def test_an_undirected_self_loop_counts_twice(populated):
+    """An undirected self-loop contributes both of its ends to the degree."""
+    if populated.is_directed():
+        pytest.skip("A directed graph splits the loop across the two roles")
+    assert populated.degree[3] == 5
+
+
 # endregion Pairs
 
 

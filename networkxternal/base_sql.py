@@ -29,6 +29,7 @@ from sqlalchemy import (
     delete,
     func,
     insert,
+    inspect,
     literal,
     or_,
     select,
@@ -51,6 +52,7 @@ from networkxternal.base_api import (
     BaseMultiGraph,
     Cursor,
     EdgeLayout,
+    NetworkXternalError,
     Role,
     Triple,
     numeric_weight,
@@ -109,6 +111,9 @@ class SQLGraph(BaseGraph):
     PAGE = 10_000
     """One statement carries this many rows; dialects cap the number of bound parameters well above it."""
 
+    PAIRS = 1_024
+    """How many pairs one row-constructor `IN` carries, which a planner's stack limits long before the parameter cap."""
+
     def __init__(self, url: str = "sqlite:///:memory:") -> None:
         super().__init__()
         if not database_exists(url):
@@ -120,7 +125,22 @@ class SQLGraph(BaseGraph):
             connect_args={"check_same_thread": False} if shared else {},
         )
         metadata.create_all(self.engine)
+        self.check_schema()
         self.tune()
+
+    def check_schema(self) -> None:
+        """Refuses a database whose tables predate this schema, since `create_all` never alters one.
+
+        The project ships no migration, so an older database is dropped and written again.
+        """
+        held = {column["name"] for column in inspect(self.engine).get_columns(edges_table.name)}
+        missing = {column.name for column in edges_table.columns} - held
+        if missing:
+            raise NetworkXternalError(
+                f"This database predates the current schema: `edges` has no {', '.join(sorted(missing))}. "
+                f"Drop its tables and write it again; no migration ships."
+                ""
+            )
 
     def tune(self) -> None:
         """Applies the dialect's performance settings; the base dialect needs none."""
@@ -258,7 +278,7 @@ class SQLGraph(BaseGraph):
         columns = tuple_(edges_table.c.source, edges_table.c.target)
         key = (edges_table.c.source, edges_table.c.target, edges_table.c.edge)
         with self.engine.connect() as connection:
-            for page in self.key_pages(list(positions), parameters_per_row=2):
+            for page in batched(positions, self.PAIRS):
                 rows = connection.execute(select(*key).where(columns.in_(list(page)))).all()
                 for row in rows:
                     for position in positions[(row.source, row.target)]:

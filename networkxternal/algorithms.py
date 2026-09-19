@@ -18,6 +18,9 @@ from networkxternal.base_api import AttributeStore, BaseGraph, DegreeView, Role,
 BOTTOM_UP_FRACTION = 0.1
 """The share of the vertex count a frontier must pass before a layer is found by scanning every edge instead."""
 
+BOTTOM_UP_FLOOR = 4_096
+"""How large a frontier must be before the vertex count is worth asking for, which some stores scan to answer."""
+
 
 # region Edge Streams
 
@@ -86,14 +89,19 @@ def breadth_first_layers(
     """
     frontier = {sources} if isinstance(sources, int) else set(sources)
     visited = set(frontier)
-    threshold = BOTTOM_UP_FRACTION * graph.number_of_nodes()
+    threshold: float | None = None
     depth = 0
     while frontier:
         yield frontier
         depth += 1
         if cutoff is not None and depth > cutoff:
             return
-        expand = expand_bottom_up if len(frontier) > threshold else expand_top_down
+        # The vertex count is asked for only once a frontier is large enough for the answer to matter,
+        # since a store without a counter answers it by scanning every key.
+        if threshold is None and len(frontier) >= BOTTOM_UP_FLOOR:
+            threshold = BOTTOM_UP_FRACTION * graph.number_of_nodes()
+        large = threshold is not None and len(frontier) > threshold
+        expand = expand_bottom_up if large else expand_top_down
         reached = expand(graph, frontier, visited)
         visited |= reached
         frontier = reached
@@ -238,9 +246,15 @@ def pagerank(
 
 
 def total_degrees(graph: BaseGraph, order: dict[int, int]) -> array:
-    """How many edge ends every vertex holds, counted in one sequential pass over the edge stream."""
+    """How many edge ends every vertex holds, counted in one sequential pass, self-loops excluded.
+
+    A self-loop joins a vertex to itself and so carries no vertex into a core; NetworkX refuses a graph
+    that has one, and peeling reads it the same way.
+    """
     degrees = array("q", [0]) * len(order)
     for source, target, _ in graph.scan_edges():
+        if source == target:
+            continue
         degrees[order[source]] += 1
         degrees[order[target]] += 1
     return degrees
@@ -261,6 +275,8 @@ def peel_below(degrees: array, alive: bytearray, cores: array, level: int) -> by
 def lower_across_peeled(graph: BaseGraph, order: dict[int, int], degrees: array, peeled: bytearray) -> None:
     """Lowers the degree of every vertex reached from one peeled this round, in one edge pass."""
     for source, target, _ in graph.scan_edges():
+        if source == target:
+            continue
         left, right = order[source], order[target]
         degrees[right] -= peeled[left]
         degrees[left] -= peeled[right]
@@ -271,7 +287,7 @@ def core_numbers(graph: BaseGraph) -> dict[int, int]:
 
     Holds one degree, one core number and one liveness byte per vertex, and spends one sequential edge
     pass per peeling round — never the neighbourhood of a peeled vertex, which is what the store would
-    have to seek for.
+    have to seek for. Self-loops carry no vertex into a core and are skipped, as NetworkX has it.
     """
     order = relabel_dense(list(graph.scan_nodes()))
     count = len(order)

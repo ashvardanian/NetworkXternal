@@ -77,6 +77,12 @@ class ClickHouseGraph(BaseGraph):
     WRITE = 1 << 16
     """How many rows one tombstone or upsert statement carries."""
 
+    QUERY_KEYS = 2_048
+    """How many keys one query binds; a parameter travels in the URL, which the server caps at 128 KiB."""
+
+    QUERY_PAIRS = 512
+    """How many pairs one query binds, an undirected lookup asking both orientations of each."""
+
     CONCURRENT = False
     """A `clickhouse_connect` client runs one query per session, so a thread needs a client of its own."""
 
@@ -170,15 +176,22 @@ class ClickHouseGraph(BaseGraph):
             SELECT source, target, edge FROM {table} FINAL
             WHERE {column} IN {{keys:Array(UInt64)}} AND is_deleted = 0 ORDER BY {column}, edge
             """
-            with self.client.query_row_block_stream(query, parameters={"keys": keys}) as stream:
-                for block in stream:
-                    for source, target, edge in block:
-                        # A self-loop sits in both tables, so the second one skips what the first reported.
-                        if source == target and role is Role.ANY:
-                            if (source, target, edge) in loops:
-                                continue
-                            loops.add((source, target, edge))
-                        yield (source if column == "source" else target), (source, target, edge)
+            for page in batched(keys, self.QUERY_KEYS):
+                yield from self._adjacent_page(query, list(page), column, role, loops)
+
+    def _adjacent_page(
+        self, query: str, keys: list[int], column: str, role: Role, loops: set[Triple]
+    ) -> Iterator[tuple[int, Triple]]:
+        """One query's worth of incident edges, streamed block by block."""
+        with self.client.query_row_block_stream(query, parameters={"keys": keys}) as stream:
+            for block in stream:
+                for source, target, edge in block:
+                    # A self-loop sits in both tables, so the second one skips what the first reported.
+                    if source == target and role is Role.ANY:
+                        if (source, target, edge) in loops:
+                            continue
+                        loops.add((source, target, edge))
+                    yield (source if column == "source" else target), (source, target, edge)
 
     def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
         positions: dict[tuple[int, int], list[int]] = {}
@@ -186,16 +199,15 @@ class ClickHouseGraph(BaseGraph):
             positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
         if not positions:
             return
-        asked = list(positions)
-        if not self.DIRECTED:
-            asked += [(target, source) for source, target in positions]
         query = """
         SELECT source, target, edge FROM edges FINAL
         WHERE (source, target) IN {pairs:Array(Tuple(UInt64, UInt64))} AND is_deleted = 0
         """
-        for source, target, edge in self.client.query(query, parameters={"pairs": asked}).result_rows:
-            for position in positions[self.canonical_pair(source, target)]:
-                yield position, (source, target, edge)
+        for page in batched(positions, self.QUERY_PAIRS):
+            asked = list(page) if self.DIRECTED else [*page, *((target, source) for source, target in page)]
+            for source, target, edge in self.client.query(query, parameters={"pairs": asked}).result_rows:
+                for position in positions[self.canonical_pair(source, target)]:
+                    yield position, (source, target, edge)
 
     def _tables_for(self, role: Role) -> tuple[tuple[str, str], ...]:
         """Which table answers a lookup in that role: the one ordered by the end being looked up."""
@@ -216,9 +228,10 @@ class ClickHouseGraph(BaseGraph):
             WHERE {column} IN {{keys:Array(UInt64)}} AND is_deleted = 0
             GROUP BY end
             """
-            for end, degree in self.client.query(query, parameters={"keys": keys}).result_rows:
-                if end in counts:
-                    counts[end] += degree
+            for page in batched(keys, self.QUERY_KEYS):
+                for end, degree in self.client.query(query, parameters={"keys": list(page)}).result_rows:
+                    if end in counts:
+                        counts[end] += degree
         return [counts[key] for key in keys]
 
     def upsert_edges(self, sources: Sequence[int], targets: Sequence[int], edges: Sequence[int]) -> None:
@@ -257,10 +270,10 @@ class ClickHouseGraph(BaseGraph):
         SELECT {column}, document FROM {table} FINAL
         WHERE {column} IN {{keys:Array(UInt64)}} AND is_deleted = 0
         """
-        found = {
-            key: json.loads(document)
-            for key, document in self.client.query(query, parameters={"keys": keys}).result_rows
-        }
+        found: dict[int, Attributes] = {}
+        for page in batched(keys, self.QUERY_KEYS):
+            rows = self.client.query(query, parameters={"keys": list(page)}).result_rows
+            found.update({key: json.loads(document) for key, document in rows})
         return [found.get(key, {}) for key in keys]
 
     def merge_documents(self, store: AttributeStore, keys: Sequence[int], entries: Sequence[Attributes]) -> None:

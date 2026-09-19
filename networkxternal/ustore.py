@@ -127,13 +127,15 @@ class UStoreGraph(BaseGraph):
                         return
 
     def adjacent_edges(self, nodes: Sequence[int], role: Role) -> Iterator[tuple[int, Triple]]:
-        """One call per page of vertices, which is the engine's own unit — a vertex's edges arrive together."""
+        """One call per page of vertices, which is the engine's own unit — a vertex's edges arrive together.
+
+        A lookup in either role finds a self-loop at both of its ends, and the verb reports it once.
+        """
         keys = list(dict.fromkeys(int(node) for node in nodes))
         for page in batched(keys, self.PAGE):
             found = self.view.graph_find_edges(list(page), role=role.value, collection=self.graph_collection)
             for index, key in enumerate(page):
-                for triple in self._triples(found, index):
-                    yield key, triple
+                yield from ((key, triple) for triple in dict.fromkeys(self._triples(found, index)))
 
     def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
         """One lookup of the distinct sources, filtered to the pairs asked about."""

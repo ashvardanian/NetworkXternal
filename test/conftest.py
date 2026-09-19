@@ -23,8 +23,9 @@ EDGES = [
     (8, 7, 2.0),
     (6, 1, 3.0),
     (7, 1, 2.0),
+    (3, 3, 1.5),
 ]
-"""A weighted graph small enough to assert on by hand, with a branch, a cycle and a bridge."""
+"""A weighted graph small enough to assert on by hand, with a branch, a cycle, a bridge and a self-loop."""
 
 BACKENDS = {
     "sqlite": ("networkxternal.sqlite", "SQLite", "sqlite:///{directory}/{shape}.db3"),

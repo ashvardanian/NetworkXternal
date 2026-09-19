@@ -46,8 +46,9 @@ def as_markdown(measurements: list[Measurement]) -> str:
         rows = [entry for entry in measurements if entry.dataset == dataset]
         lines.append(f"### {dataset}, operations per second\n")
         lines.extend(table_of(rows, lambda entry: f"{entry.rate:,.0f}"))
-        lines.append(f"### {dataset}, peak bytes held\n")
-        lines.extend(table_of(rows, lambda entry: f"{entry.peak_bytes:,.0f}"))
+        if any(entry.peak_bytes for entry in rows):
+            lines.append(f"### {dataset}, peak bytes held\n")
+            lines.extend(table_of(rows, lambda entry: f"{entry.peak_bytes:,.0f}"))
     return "\n".join(lines)
 
 
