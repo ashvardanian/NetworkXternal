@@ -15,11 +15,11 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Sequence
 from contextlib import nullcontext
-from itertools import batched, islice
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
-from ustore.keys import scan_keys
+from ustore.keys import KEY_MAX, KEY_MIN, scan_keys
 from ustore.lib import Database, Transaction
 
 from networkxternal.base_api import (
@@ -161,12 +161,24 @@ class UStoreGraph(BaseGraph):
         return self.view.contains(node, collection=self.graph_collection)
 
     def number_of_nodes(self) -> int:
+        """The engine's own count where it is exact, and a scan where the engine can only bound it."""
+        held = self.view.measure(KEY_MIN, KEY_MAX, collection=self.graph_collection)
+        if held["min_cardinality"] == held["max_cardinality"]:
+            return held["min_cardinality"]
         return sum(1 for _ in self.scan_nodes())
 
     def upsert_nodes(self, nodes: Sequence[int]) -> None:
-        # A batch whose every vertex already exists is refused by the C ABI, so only the absent ones travel.
-        keys = list(nodes)
-        missing = [key for key in keys if not self.view.contains(key, collection=self.graph_collection)]
+        """Inserts the vertices the graph does not hold, asking which those are in one call.
+
+        A batch whose every vertex already exists is refused by the C ABI, and a presence check per key
+        was one round trip per key on the import path; one batched scan answers the whole page.
+        """
+        keys = list(dict.fromkeys(int(node) for node in nodes))
+        if not keys:
+            return
+        found = self.view.scan_batch(keys, [1] * len(keys), collection=self.graph_collection)
+        held = {run[0] for index in range(len(keys)) if (run := found[index]) is not None and len(run)}
+        missing = [key for key in keys if key not in held]
         if missing:
             self.view.graph_upsert_vertices(missing, collection=self.graph_collection)
 
@@ -266,11 +278,13 @@ class UStoreGraph(BaseGraph):
             self.view.close()
 
     def clear(self) -> None:
-        while page := list(islice(self.scan_nodes(), self.PAGE)):
-            self.view.graph_remove_vertices(page, collection=self.graph_collection)
-        for collection in (self.nodes_collection, self.edges_collection):
-            while page := list(islice(scan_keys(self.view, collection, self.PAGE), self.PAGE)):
-                self.view.pop(page, collection=collection)
+        """Empties every collection in one call each, rather than walking and popping key by key."""
+        database = self.view if isinstance(self.view, Database) else self.view.database
+        for collection in (self.graph_collection, self.nodes_collection, self.edges_collection):
+            database.collection_drop(collection, mode="pairs")
+        self._write_meta(
+            self.view, {"directed": self.DIRECTED, "multigraph": self.MULTIGRAPH, "next_edge": FIRST_EDGE_ID}
+        )
         self.forget_edge_ids()
 
     # endregion Storage Verbs
