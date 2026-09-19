@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator, Sequence
+from functools import partial
 from itertools import batched
 from typing import Any
 
@@ -54,11 +55,12 @@ from networkxternal.base_api import (
     BaseMultiDiGraph,
     BaseMultiGraph,
     Cursor,
-    EdgeLayout,
     NetworkXternalError,
     Role,
     Triple,
+    ends_asked,
     numeric_weight,
+    per_key,
 )
 
 PARAMETER_CAPS = {"mysql": 65_535, "mariadb": 65_535, "postgresql": 65_535, "sqlite": 32_766}
@@ -116,10 +118,11 @@ def without_numeric_weight(document: Attributes) -> Attributes:
 
 
 class SQLGraph(BaseGraph):
-    """An undirected simple graph stored in a SQL database, as `networkx.Graph` is in RAM."""
+    """An undirected simple graph stored in a SQL database, as `networkx.Graph` is in RAM.
 
-    LAYOUT = EdgeLayout.CANONICAL
-    """One row holds an undirected edge with `source <= target`, so a pair is one equality probe."""
+    One row holds an undirected edge, with `source <= target`, so a pair lookup is one equality probe
+    and the reverse index still answers an adjacency read from the other end.
+    """
 
     PAGE = 10_000
     """One statement carries this many rows; dialects cap the number of bound parameters well above it."""
@@ -222,15 +225,6 @@ class SQLGraph(BaseGraph):
     def _role_column(self, role: Role) -> Column:
         return edges_table.c.source if role is Role.SOURCE else edges_table.c.target
 
-    @staticmethod
-    def _ends(source: int, target: int, role: Role) -> tuple[int, ...]:
-        """Which ends of a found edge the lookup was asking about."""
-        if role is Role.SOURCE:
-            return (source,)
-        if role is Role.TARGET:
-            return (target,)
-        return (source,) if source == target else (source, target)
-
     def _role_clause(self, keys: Sequence[int], role: Role):
         if role is Role.SOURCE:
             return edges_table.c.source.in_(keys)
@@ -310,37 +304,20 @@ class SQLGraph(BaseGraph):
                 connection.execute(delete(nodes_table).where(nodes_table.c.node.in_(page)))
 
     def scan_edges(self, after: Cursor = None, limit: int | None = None) -> Iterator[Triple]:
-        remaining = limit
-        cursor = after
-        while remaining is None or remaining > 0:
-            width = self.PAGE if remaining is None else min(self.PAGE, remaining)
-            rows = self._edge_page(None, Role.ANY, cursor, width)
-            yield from rows
-            if len(rows) < width:
-                return
-            cursor = rows[-1]
-            if remaining is not None:
-                remaining -= len(rows)
+        return self.paginate(partial(self._edge_page, None, Role.ANY), after, limit)
 
     def adjacent_edges(self, nodes: Sequence[int], role: Role) -> Iterator[tuple[int, Triple]]:
         keys = list(dict.fromkeys(int(node) for node in nodes))
         for page in self.key_pages(keys, parameters_per_row=2 if role is Role.ANY else 1):
             wanted = set(page)
-            cursor: Cursor = None
-            while True:
-                rows = self._edge_page(page, role, cursor, self.PAGE)
-                for source, target, edge in rows:
-                    for end in self._ends(source, target, role):
-                        if end in wanted:
-                            yield end, (source, target, edge)
-                if len(rows) < self.PAGE:
-                    break
-                cursor = rows[-1]
+            walk = self.paginate(partial(self._edge_page, page, role))
+            for source, target, edge in walk:
+                for end in ends_asked(source, target, role):
+                    if end in wanted:
+                        yield end, (source, target, edge)
 
     def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
-        positions: dict[tuple[int, int], list[int]] = {}
-        for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
-            positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
+        positions = self.group_pairs(sources, targets)
         if not positions:
             return
         columns = tuple_(edges_table.c.source, edges_table.c.target)
@@ -349,8 +326,7 @@ class SQLGraph(BaseGraph):
             for page in batched(positions, self.PAIRS):
                 rows = connection.execute(select(*key).where(columns.in_(list(page)))).all()
                 for row in rows:
-                    for position in positions[(row.source, row.target)]:
-                        yield position, (row.source, row.target, row.edge)
+                    yield from self.fan_out(positions, (row.source, row.target, row.edge))
 
     def _edge_page(self, nodes: Sequence[int] | None, role: Role, after: Cursor, width: int) -> list[Triple]:
         """One page of edges in key order, resumed after `after`, read and handed back without a live cursor.
@@ -456,8 +432,7 @@ class SQLGraph(BaseGraph):
         column = self._key_column(store)
         stored = self.read_documents(store, keys)
         merged: dict[int, Attributes] = {}
-        for index, (key, held) in enumerate(zip(keys, stored, strict=True)):
-            entry = entries[0] if len(entries) == 1 else entries[index]
+        for key, held, entry in zip(keys, stored, per_key(keys, entries), strict=True):
             merged[int(key)] = {**merged.get(int(key), held), **entry}
         if store is AttributeStore.EDGES:
             merged = self._lift_weights(merged)
@@ -488,7 +463,7 @@ class SQLGraph(BaseGraph):
                 if cleared:
                     connection.execute(update(edges_table).where(edges_table.c.edge.in_(page)).values(weight=None))
 
-    def clear(self) -> None:
+    def clear_storage(self) -> None:
         with self.engine.begin() as connection:
             for table in (edge_attributes_table, node_attributes_table, edges_table, nodes_table):
                 connection.execute(delete(table))
@@ -496,7 +471,6 @@ class SQLGraph(BaseGraph):
             connection.execute(
                 update(meta_table).where(meta_table.c.graph == self.GRAPH).values(next_edge=FIRST_EDGE_ID)
             )
-        self.forget_edge_ids()
 
     def close(self) -> None:
         self.engine.dispose()

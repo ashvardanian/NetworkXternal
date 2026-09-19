@@ -25,6 +25,7 @@ from networkxternal.base_api import (
     NetworkXternalError,
     Role,
     Triple,
+    per_key,
 )
 
 BATCH = 1_000
@@ -274,11 +275,7 @@ class Neo4JGraph(BaseGraph):
         keys = list(keys)
         if not keys:
             return
-        shared = entries[0] if len(entries) == 1 else None
-        rows = [
-            {"key": int(key), "held": shared if shared is not None else entries[index]}
-            for index, key in enumerate(keys)
-        ]
+        rows = [{"key": int(key), "held": entry} for key, entry in zip(keys, per_key(keys, entries), strict=True)]
         if store is AttributeStore.NODES:
             query = f"UNWIND $rows AS row MATCH (v:{self.vertex} {{id: row.key}}) SET v += row.held"
         else:
@@ -298,11 +295,10 @@ class Neo4JGraph(BaseGraph):
         with self.driver.session() as session:
             session.run(query, keys=keys)
 
-    def clear(self) -> None:
+    def clear_storage(self) -> None:
         with self.driver.session() as session:
             session.run(f"MATCH (v:{self.vertex}) CALL (v) {{ DETACH DELETE v }} IN TRANSACTIONS OF {BATCH} ROWS")
             session.run(f"MATCH (m:{self.meta}) SET m.next_edge = $first", first=FIRST_EDGE_ID)
-        self.forget_edge_ids()
 
     def close(self) -> None:
         self.driver.close()

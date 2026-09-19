@@ -217,19 +217,16 @@ class UStoreGraph(BaseGraph):
 
     def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
         """One lookup of the distinct sources, filtered to the pairs asked about."""
-        positions: dict[tuple[int, int], list[int]] = {}
-        for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
-            positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
+        positions = self.group_pairs(sources, targets)
         if not positions:
             return
         wanted = list({source for source, _ in positions})
         reported: set[tuple[int, Triple]] = set()
         for _, triple in self.adjacent_edges(wanted, self.outgoing_role):
-            pair = self.canonical_pair(triple[0], triple[1])
-            for position in positions.get(pair, ()):
-                if (position, triple) not in reported:
-                    reported.add((position, triple))
-                    yield position, triple
+            for found in self.fan_out(positions, triple):
+                if found not in reported:
+                    reported.add(found)
+                    yield found
 
     def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
         keys = list(nodes)
@@ -277,7 +274,7 @@ class UStoreGraph(BaseGraph):
         if isinstance(self.view, Database):
             self.view.close()
 
-    def clear(self) -> None:
+    def clear_storage(self) -> None:
         """Empties every collection in one call each, rather than walking and popping key by key."""
         database = self.view if isinstance(self.view, Database) else self.view.database
         for collection in (self.graph_collection, self.nodes_collection, self.edges_collection):
@@ -285,7 +282,6 @@ class UStoreGraph(BaseGraph):
         self._write_meta(
             self.view, {"directed": self.DIRECTED, "multigraph": self.MULTIGRAPH, "next_edge": FIRST_EDGE_ID}
         )
-        self.forget_edge_ids()
 
     # endregion Storage Verbs
 

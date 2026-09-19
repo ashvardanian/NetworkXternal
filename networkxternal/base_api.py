@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from enum import StrEnum
-from itertools import batched, islice
+from itertools import batched, islice, repeat
 from threading import Lock
 from typing import Any, ClassVar
 
@@ -22,6 +22,31 @@ class NetworkXternalError(Exception):
     """Raised where NetworkX raises `NetworkXError`: a vertex or edge the graph does not hold."""
 
 
+def numeric_weight(value: Any) -> float | None:
+    """The value as a weight, or `None` where it is missing or is not a number a column could hold."""
+    if type(value) is int or type(value) is float:
+        return float(value)
+    return None
+
+
+def ends_asked(source: int, target: int, role: Role) -> tuple[int, ...]:
+    """Which ends of a found edge a lookup in that role was asking about; a self-loop answers once."""
+    if role is Role.SOURCE:
+        return (source,)
+    if role is Role.TARGET:
+        return (target,)
+    return (source,) if source == target else (source, target)
+
+
+def per_key(keys: Sequence[int], entries: Sequence[Attributes]) -> Iterable[Attributes]:
+    """One entry repeated for every key, or one entry per key, which is how every attribute write arrives."""
+    if len(entries) == 1:
+        return repeat(entries[0], len(keys))
+    if len(entries) != len(keys):
+        raise ValueError(f"Got {len(entries)} documents for {len(keys)} keys")
+    return entries
+
+
 class Role(StrEnum):
     """The end of an edge a vertex is looked up by."""
 
@@ -35,24 +60,6 @@ class AttributeStore(StrEnum):
 
     NODES = "nodes"
     EDGES = "edges"
-
-
-class EdgeLayout(StrEnum):
-    """How a backend stores an undirected edge, which decides what a reverse lookup costs."""
-
-    NATIVE = "native"
-    """The engine reaches a relationship from either end on its own: UStore, Neo4J and Memgraph."""
-
-    CANONICAL = "canonical"
-    """One row per edge, holding `source <= target` because the write normalized it: SQL and MongoDB."""
-
-    MIRRORED = "mirrored"
-    """Two rows sharing one edge identifier, one ordered by each end: ClickHouse, which has no secondary index."""
-
-
-def numeric_weight(value: Any) -> float | None:
-    """A weight as a float, or `None` where the attribute is missing, boolean, or not a number."""
-    return float(value) if type(value) is int or type(value) is float else None
 
 
 class NodeView:
@@ -187,9 +194,6 @@ class BaseGraph(ABC):
 
     DIRECTED: ClassVar[bool] = False
     MULTIGRAPH: ClassVar[bool] = False
-
-    LAYOUT: ClassVar[EdgeLayout] = EdgeLayout.NATIVE
-    """How this backend stores an undirected edge, which a reverse lookup and a removal both consult."""
 
     PAGE: ClassVar[int] = 1 << 12
     """How many keys one round-trip carries; a backend lowers it where the wire format is heavy."""
@@ -334,8 +338,13 @@ class BaseGraph(ABC):
         """Removes the attribute document of every key."""
 
     @abstractmethod
+    def clear_storage(self) -> None:
+        """Removes every vertex, every edge, and the attributes of both, from the store."""
+
     def clear(self) -> None:
-        """Removes every vertex, every edge, and the attributes of both."""
+        """Empties the graph and forgets the identifiers it had handed out."""
+        self.clear_storage()
+        self.forget_edge_ids()
 
     # endregion Storage Verbs
 
@@ -408,6 +417,40 @@ class BaseGraph(ABC):
     def canonical_pair(self, source: int, target: int) -> tuple[int, int]:
         """The pair both orientations of an undirected edge share."""
         return (source, target) if self.DIRECTED else (min(source, target), max(source, target))
+
+    def paginate(
+        self,
+        fetch: Callable[[Cursor, int], list[Triple]],
+        after: Cursor = None,
+        limit: int | None = None,
+    ) -> Iterator[Triple]:
+        """Walks pages of a keyset stream, resuming after the last row of the page before.
+
+        `fetch(cursor, width)` answers at most `width` triples in key order, strictly after `cursor`,
+        holding no live cursor of its own — a short page ends the walk.
+        """
+        remaining = limit
+        cursor = after
+        while remaining is None or remaining > 0:
+            width = self.PAGE if remaining is None else min(self.PAGE, remaining)
+            page = fetch(cursor, width)
+            yield from page
+            if len(page) < width:
+                return
+            cursor = page[-1]
+            remaining = None if remaining is None else remaining - len(page)
+
+    def group_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> dict[tuple[int, int], list[int]]:
+        """Every pair asked about as its key, mapped to the positions that asked for it."""
+        positions: dict[tuple[int, int], list[int]] = {}
+        for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
+            positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
+        return positions
+
+    def fan_out(self, positions: Mapping[tuple[int, int], list[int]], triple: Triple) -> Iterator[tuple[int, Triple]]:
+        """One found edge, reported once per position that asked for its pair."""
+        for position in positions.get(self.canonical_pair(triple[0], triple[1]), ()):
+            yield position, triple
 
     def edges_of_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> list[list[Triple]]:
         """The edges between each pair, one list per pair, holding no more than the batch asked about."""

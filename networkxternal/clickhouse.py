@@ -27,10 +27,10 @@ from networkxternal.base_api import (
     BaseMultiDiGraph,
     BaseMultiGraph,
     Cursor,
-    EdgeLayout,
     NetworkXternalError,
     Role,
     Triple,
+    per_key,
 )
 
 SCHEMA = (
@@ -72,10 +72,11 @@ SCHEMA = (
 
 
 class ClickHouseGraph(BaseGraph):
-    """An undirected simple graph stored in ClickHouse, as `networkx.Graph` is in RAM."""
+    """An undirected simple graph stored in ClickHouse, as `networkx.Graph` is in RAM.
 
-    LAYOUT = EdgeLayout.MIRRORED
-    """An undirected edge is two rows sharing one identifier, one ordered by each end, since there is no index."""
+    An undirected edge is two rows sharing one identifier, one ordered by each end, because a column
+    store has no secondary index and the mirror is what answers a reverse lookup.
+    """
 
     PAGE = 1 << 20
     """A column store punishes small inserts with too many parts, so pages here are far larger than a row store's."""
@@ -242,9 +243,7 @@ class ClickHouseGraph(BaseGraph):
                     yield (source if column == "source" else target), (source, target, edge)
 
     def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
-        positions: dict[tuple[int, int], list[int]] = {}
-        for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
-            positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
+        positions = self.group_pairs(sources, targets)
         if not positions:
             return
         query = """
@@ -254,8 +253,7 @@ class ClickHouseGraph(BaseGraph):
         for page in batched(positions, self.QUERY_PAIRS):
             asked = list(page) if self.DIRECTED else [*page, *((target, source) for source, target in page)]
             for source, target, edge in self.client.query(query, parameters={"pairs": asked}).result_rows:
-                for position in positions[self.canonical_pair(source, target)]:
-                    yield position, (source, target, edge)
+                yield from self.fan_out(positions, (source, target, edge))
 
     def _tables_for(self, role: Role) -> tuple[tuple[str, str], ...]:
         """Which table answers a lookup in that role: the one ordered by the end being looked up."""
@@ -331,8 +329,7 @@ class ClickHouseGraph(BaseGraph):
         table, column = self._attributes_table(store)
         stored = self.read_documents(store, keys)
         merged: dict[int, Attributes] = {}
-        for index, (key, held) in enumerate(zip(keys, stored, strict=True)):
-            entry = entries[0] if len(entries) == 1 else entries[index]
+        for key, held, entry in zip(keys, stored, per_key(keys, entries), strict=True):
             merged[int(key)] = {**merged.get(int(key), held), **entry}
         version = self._version()
         rows = [[key, json.dumps(entry), version, 0] for key, entry in merged.items()]
@@ -347,12 +344,11 @@ class ClickHouseGraph(BaseGraph):
         rows = [[int(key), "{}", version, 1] for key in keys]
         self.client.insert(table, rows, column_names=[column, "document", "version", "is_deleted"])
 
-    def clear(self) -> None:
+    def clear_storage(self) -> None:
         """Truncation is the one removal a column store does cheaply, so clearing skips the tombstones."""
         # The shape a graph was written as outlives its rows, so the meta table is not truncated.
         for table in ("nodes", "edges", "edges_by_target", "node_attributes", "edge_attributes"):
             self.client.command(f"TRUNCATE TABLE {table}")
-        self.forget_edge_ids()
 
     def close(self) -> None:
         self.client.close()

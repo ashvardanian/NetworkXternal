@@ -24,11 +24,12 @@ from networkxternal.base_api import (
     BaseMultiDiGraph,
     BaseMultiGraph,
     Cursor,
-    EdgeLayout,
     NetworkXternalError,
     Role,
     Triple,
+    ends_asked,
     numeric_weight,
+    per_key,
 )
 
 
@@ -39,10 +40,11 @@ def database_name(url: str, default: str = "graph") -> str:
 
 
 class MongoGraph(BaseGraph):
-    """An undirected simple graph stored in MongoDB, as `networkx.Graph` is in RAM."""
+    """An undirected simple graph stored in MongoDB, as `networkx.Graph` is in RAM.
 
-    LAYOUT = EdgeLayout.CANONICAL
-    """One document holds an undirected edge with `source <= target`, so a pair is one equality probe."""
+    One document holds an undirected edge, with `source <= target`, so a pair lookup is one equality
+    probe and the reverse compound index still answers an adjacency read from the other end.
+    """
 
     PAGE = 10_000
     """Batch writes beyond this size bring no further throughput and cost a lot of memory on the server."""
@@ -107,15 +109,6 @@ class MongoGraph(BaseGraph):
         self.edges_collection.create_index([("source", 1), ("target", 1)])
         self.edges_collection.create_index([("target", 1), ("source", 1)])
 
-    @staticmethod
-    def _ends(source: int, target: int, role: Role) -> tuple[int, ...]:
-        """Which ends of a found edge the lookup was asking about."""
-        if role is Role.SOURCE:
-            return (source,)
-        if role is Role.TARGET:
-            return (target,)
-        return (source,) if source == target else (source, target)
-
     def _role_filter(self, keys: Sequence[int], role: Role) -> dict:
         if role is Role.SOURCE:
             return {"source": {"$in": list(keys)}}
@@ -178,7 +171,7 @@ class MongoGraph(BaseGraph):
             while True:
                 found = self._edge_page(self._role_filter(list(page), role), cursor, self.PAGE)
                 for source, target, edge in found:
-                    for end in self._ends(source, target, role):
+                    for end in ends_asked(source, target, role):
                         if end in wanted:
                             yield end, (source, target, edge)
                 if len(found) < self.PAGE:
@@ -186,16 +179,12 @@ class MongoGraph(BaseGraph):
                 cursor = found[-1]
 
     def find_pairs(self, sources: Sequence[int], targets: Sequence[int]) -> Iterator[tuple[int, Triple]]:
-        positions: dict[tuple[int, int], list[int]] = {}
-        for position, (source, target) in enumerate(zip(sources, targets, strict=True)):
-            positions.setdefault(self.canonical_pair(int(source), int(target)), []).append(position)
+        positions = self.group_pairs(sources, targets)
         for page in batched(positions, self.PAIRS):
             clauses = [{"source": source, "target": target} for source, target in page]
             found = self.edges_collection.find({"$or": clauses}, {"source": 1, "target": 1})
             for document in found:
-                source, target = document["source"], document["target"]
-                for position in positions[(source, target)]:
-                    yield position, (source, target, document["_id"])
+                yield from self.fan_out(positions, (document["source"], document["target"], document["_id"]))
 
     def _edge_page(self, wanted: dict, after: Cursor, width: int) -> list[Triple]:
         """One page of edges in key order, resumed after `after`, read whole so no cursor stays open."""
@@ -279,10 +268,9 @@ class MongoGraph(BaseGraph):
             for name in entry:
                 if name.startswith("$") or "." in name:
                     raise ValueError(f"MongoDB reads {name!r} as a path or an operator, not as a field name")
-        shared = entries[0] if len(entries) == 1 else None
         writes = [
-            UpdateOne({"_id": key}, {"$set": shared if shared is not None else entries[index]}, upsert=True)
-            for index, key in enumerate(keys)
+            UpdateOne({"_id": key}, {"$set": entry}, upsert=True)
+            for key, entry in zip(keys, per_key(keys, entries), strict=True)
         ]
         for page in batched(writes, self.PAGE):
             self.stores[store].bulk_write(list(page), ordered=False)
@@ -291,14 +279,13 @@ class MongoGraph(BaseGraph):
         if len(keys):
             self.stores[store].delete_many({"_id": {"$in": list(keys)}})
 
-    def clear(self) -> None:
+    def clear_storage(self) -> None:
         self.edges_collection.drop()
         self.nodes_collection.drop()
         self.meta_collection.update_one({"_id": self.GRAPH}, {"$set": {"next_edge": FIRST_EDGE_ID}})
         for collection in self.stores.values():
             collection.drop()
         self._create_indexes()
-        self.forget_edge_ids()
 
     def close(self) -> None:
         self.client.close()

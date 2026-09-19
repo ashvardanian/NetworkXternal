@@ -41,10 +41,9 @@ class MemgraphGraph(Neo4JGraph):
             counts = {record["key"]: record["degree"] for record in session.run(query, keys=keys)}
         return [counts.get(key, 0) for key in keys]
 
-    def clear(self) -> None:
+    def clear_storage(self) -> None:
         with self.driver.session() as session:
             session.run(f"MATCH (v:{self.vertex}) DETACH DELETE v")
-        self.forget_edge_ids()
 
 
 class MemgraphDiGraph(MemgraphGraph, BaseDiGraph):
