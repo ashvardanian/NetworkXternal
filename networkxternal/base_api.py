@@ -200,8 +200,23 @@ class BaseGraph(ABC):
     __networkx_backend__: ClassVar[str] = "networkxternal"
     """The name NetworkX dispatches by, so `nx.pagerank(graph, backend="networkxternal")` finds this graph."""
 
+    SHARES_STORE: ClassVar[bool] = True
+    """Whether two graph objects on one connection string address the same data, as a server's clients do."""
+
+    SHARES_IDENTIFIERS: ClassVar[bool] = True
+    """Whether two writers on one store are handed disjoint identifiers, which needs a durable counter."""
+
+    LEASE: ClassVar[int] = 1_000
+    """How many identifiers one durable claim leases, so a bulk load pays a round trip per thousand edges."""
+
     def __init__(self) -> None:
         self.next_edge_id: int | None = None
+        self.leased_next = 0
+        """The next identifier of the lease this instance holds."""
+
+        self.leased_left = 0
+        """How many identifiers of that lease are still unhanded."""
+
         self.graph: dict[str, Any] = {}
         self.edge_ids_lock = Lock()
         """Guards the identifier counter, which several threads sharing one instance would otherwise race."""
@@ -405,21 +420,39 @@ class BaseGraph(ABC):
         """The edges between one pair, which is bounded by the multiplicity of that pair alone."""
         return [triple for _, triple in self.find_pairs([source], [target])]
 
+    def claim_edge_ids(self, count: int) -> int:
+        """The first of `count` identifiers no other writer will be handed.
+
+        The base claims them in this process alone, which is all a store without a durable counter can
+        promise; a backend that can hold one overrides this and two processes stop colliding.
+        """
+        if self.next_edge_id is None:
+            self.next_edge_id = max(self.biggest_edge_id() + 1, FIRST_EDGE_ID)
+        first = self.next_edge_id
+        self.next_edge_id += count
+        return first
+
     def raise_edge_floor(self, floor: int) -> None:
         """Keeps every identifier below `floor` out of the allocator, for a key the caller chose itself."""
+        self.next_edge_id = max(self.next_edge_id or 0, floor)
+
+    def forget_edge_ids(self) -> None:
+        """Drops the lease and the counter, so the next allocation asks the store again."""
         with self.edge_ids_lock:
-            self.next_edge_id = max(self.next_edge_id or 0, floor)
+            self.next_edge_id = None
+            self.leased_next = self.leased_left = 0
 
     def allocate_edge_ids(self, count: int) -> list[int]:
-        """Hands out identifiers past every one the graph already holds, to one thread at a time.
-
-        The lock covers the threads sharing this instance; two processes still need a durable claim.
-        """
+        """Hands out identifiers from the lease this instance holds, claiming another when it runs out."""
+        if count <= 0:
+            return []
         with self.edge_ids_lock:
-            if self.next_edge_id is None:
-                self.next_edge_id = max(self.biggest_edge_id() + 1, FIRST_EDGE_ID)
-            first = self.next_edge_id
-            self.next_edge_id += count
+            if self.leased_left < count:
+                wanted = max(count, self.LEASE)
+                self.leased_next, self.leased_left = self.claim_edge_ids(wanted), wanted
+            first = self.leased_next
+            self.leased_next += count
+            self.leased_left -= count
         return list(range(first, first + count))
 
     def add_edges_from_arrays(
@@ -450,7 +483,11 @@ class BaseGraph(ABC):
         if self.MULTIGRAPH:
             fresh = iter(self.allocate_edge_ids(sum(key is None for key in wanted)))
             identifiers = [next(fresh) if key is None else key for key in wanted]
-            self.raise_edge_floor(max((key + 1 for key in wanted if key is not None), default=0))
+            floor = max((key + 1 for key in wanted if key is not None), default=0)
+            if floor > self.leased_next:
+                with self.edge_ids_lock:
+                    self.leased_left = 0
+                    self.raise_edge_floor(floor)
             upserted = list(zip(sources, targets, identifiers, strict=True))
         else:
             stored = self.edges_of_pairs(sources, targets)
@@ -646,7 +683,7 @@ class BaseGraph(ABC):
             sources, targets, identifiers = zip(*page, strict=True)
             self.drop_edges(sources, targets, identifiers)
             self.drop_documents(AttributeStore.EDGES, identifiers)
-        self.next_edge_id = None
+        self.forget_edge_ids()
 
     # endregion Edges
 

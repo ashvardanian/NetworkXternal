@@ -44,14 +44,42 @@ SHAPES = ("Graph", "DiGraph", "MultiGraph", "MultiDiGraph")
 """The four NetworkX shapes every backend implements, named as NetworkX names them."""
 
 
+def graph_url(shape: str, directory) -> str:
+    """The connection string this run addresses one shape of graph by."""
+    _, _, template = BACKENDS[os.getenv("NETWORKXTERNAL_TEST_BACKEND", "sqlite")]
+    return os.getenv("NETWORKXTERNAL_TEST_URL", template).format(directory=directory, shape=shape.lower())
+
+
+def open_graph(shape: str, url: str):
+    """Opens one shape of graph on this run's backend."""
+    module, prefix, _ = BACKENDS[os.getenv("NETWORKXTERNAL_TEST_BACKEND", "sqlite")]
+    return getattr(import_module(module), f"{prefix}{shape}")(url)
+
+
 @pytest.fixture(params=SHAPES, ids=[shape.lower() for shape in SHAPES])
 def empty(request, tmp_path):
     """An empty graph of one shape, in a store of its own, cleared before the test and closed after."""
-    backend = os.getenv("NETWORKXTERNAL_TEST_BACKEND", "sqlite")
-    module, prefix, template = BACKENDS[backend]
-    url = os.getenv("NETWORKXTERNAL_TEST_URL", template).format(directory=tmp_path, shape=request.param.lower())
-    with getattr(import_module(module), f"{prefix}{request.param}")(url) as graph:
+    url = graph_url(request.param, tmp_path)
+    with open_graph(request.param, url) as graph:
+        graph.opened_as = (request.param, url)
+        """The shape and connection string a test reopens this graph by."""
         graph.clear()
+        yield graph
+
+
+@pytest.fixture
+def open_as():
+    """Opens a named shape on a given connection string, for a test that reopens a stored graph."""
+    return open_graph
+
+
+@pytest.fixture
+def second(empty):
+    """A second graph object addressing the same store, which an in-memory database cannot offer."""
+    shape, url = empty.opened_as
+    if ":memory:" in url or not type(empty).SHARES_STORE:
+        pytest.skip(f"{type(empty).__name__} does not address one store from two objects")
+    with open_graph(shape, url) as graph:
         yield graph
 
 

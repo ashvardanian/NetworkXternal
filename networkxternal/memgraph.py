@@ -44,7 +44,7 @@ class MemgraphGraph(Neo4JGraph):
     def clear(self) -> None:
         with self.driver.session() as session:
             session.run(f"MATCH (v:{self.vertex}) DETACH DELETE v")
-        self.next_edge_id = None
+        self.forget_edge_ids()
 
 
 class MemgraphDiGraph(MemgraphGraph, BaseDiGraph):

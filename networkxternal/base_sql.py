@@ -18,10 +18,12 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     Float,
     Index,
     MetaData,
+    String,
     Table,
     Text,
     bindparam,
@@ -44,6 +46,7 @@ from sqlalchemy.pool import StaticPool
 from sqlalchemy_utils import create_database, database_exists
 
 from networkxternal.base_api import (
+    FIRST_EDGE_ID,
     Attributes,
     AttributeStore,
     BaseDiGraph,
@@ -91,6 +94,16 @@ edge_attributes_table = Table(
     Column("document", Text, nullable=False),
 )
 
+meta_table = Table(
+    "graph_meta",
+    metadata,
+    Column("graph", String(64), primary_key=True),
+    Column("directed", Boolean, nullable=False),
+    Column("multigraph", Boolean, nullable=False),
+    Column("next_edge", BigInteger, nullable=False),
+)
+"""One row per graph, holding the shape it was written as and the identifier no writer has passed yet."""
+
 Index("edges_by_source", edges_table.c.source, edges_table.c.target, edges_table.c.edge, edges_table.c.weight)
 Index("edges_by_target", edges_table.c.target, edges_table.c.source, edges_table.c.edge, edges_table.c.weight)
 
@@ -125,8 +138,62 @@ class SQLGraph(BaseGraph):
             connect_args={"check_same_thread": False} if shared else {},
         )
         metadata.create_all(self.engine)
-        self.check_schema()
-        self.tune()
+        try:
+            self.check_schema()
+            self.tune()
+        except Exception:
+            # A refused database leaves no object to close, so its connections are released here.
+            self.engine.dispose()
+            raise
+
+    GRAPH = "graph"
+    """The name the meta row is keyed by; one database holds one graph."""
+
+    def claim_edge_ids(self, count: int) -> int:
+        """Claims a run of identifiers in one statement, so two processes never hand out the same one."""
+        with self.engine.begin() as connection:
+            self._seed_meta(connection)
+            wanted = meta_table.c.graph == self.GRAPH
+            if self.engine.dialect.update_returning:
+                raised = (
+                    update(meta_table)
+                    .where(wanted)
+                    .values(next_edge=meta_table.c.next_edge + count)
+                    .returning(meta_table.c.next_edge)
+                )
+                return connection.execute(raised).scalar_one() - count
+            # MySQL has no `RETURNING`, so the row is locked for the transaction instead.
+            held = connection.execute(select(meta_table.c.next_edge).where(wanted).with_for_update()).scalar_one()
+            connection.execute(update(meta_table).where(wanted).values(next_edge=held + count))
+            return held
+
+    def raise_edge_floor(self, floor: int) -> None:
+        with self.engine.begin() as connection:
+            self._seed_meta(connection)
+            connection.execute(
+                update(meta_table)
+                .where(meta_table.c.graph == self.GRAPH, meta_table.c.next_edge < floor)
+                .values(next_edge=floor)
+            )
+
+    def _seed_meta(self, connection) -> None:
+        """Writes the meta row on first use, and refuses a database written as another shape."""
+        held = connection.execute(select(meta_table).where(meta_table.c.graph == self.GRAPH)).first()
+        if held is None:
+            first = max(self.biggest_edge_id() + 1, FIRST_EDGE_ID)
+            row = {
+                "graph": self.GRAPH,
+                "directed": self.DIRECTED,
+                "multigraph": self.MULTIGRAPH,
+                "next_edge": first,
+            }
+            connection.execute(self.insert_ignore(meta_table), [row])
+            return
+        if (held.directed, held.multigraph) != (self.DIRECTED, self.MULTIGRAPH):
+            raise NetworkXternalError(
+                f"This database was written as directed={held.directed}, multigraph={held.multigraph}, "
+                f"and is being opened as directed={self.DIRECTED}, multigraph={self.MULTIGRAPH}"
+            )
 
     def check_schema(self) -> None:
         """Refuses a database whose tables predate this schema, since `create_all` never alters one.
@@ -139,8 +206,9 @@ class SQLGraph(BaseGraph):
             raise NetworkXternalError(
                 f"This database predates the current schema: `edges` has no {', '.join(sorted(missing))}. "
                 f"Drop its tables and write it again; no migration ships."
-                ""
             )
+        with self.engine.begin() as connection:
+            self._seed_meta(connection)
 
     def tune(self) -> None:
         """Applies the dialect's performance settings; the base dialect needs none."""
@@ -424,7 +492,11 @@ class SQLGraph(BaseGraph):
         with self.engine.begin() as connection:
             for table in (edge_attributes_table, node_attributes_table, edges_table, nodes_table):
                 connection.execute(delete(table))
-        self.next_edge_id = None
+            # The shape a graph was written as outlives its rows; only the identifier counter rewinds.
+            connection.execute(
+                update(meta_table).where(meta_table.c.graph == self.GRAPH).values(next_edge=FIRST_EDGE_ID)
+            )
+        self.forget_edge_ids()
 
     def close(self) -> None:
         self.engine.dispose()

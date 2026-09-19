@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from neo4j import GraphDatabase
 
 from networkxternal.base_api import (
+    FIRST_EDGE_ID,
     Attributes,
     AttributeStore,
     BaseDiGraph,
@@ -21,6 +22,7 @@ from networkxternal.base_api import (
     BaseMultiDiGraph,
     BaseMultiGraph,
     Cursor,
+    NetworkXternalError,
     Role,
     Triple,
 )
@@ -51,14 +53,58 @@ class Neo4JGraph(BaseGraph):
             auth=(address.username, address.password) if address.username else None,
         )
         self.vertex = f"`{graph_name(url)}`"
+        self.meta = f"`{graph_name(url)}_META`"
+        """The label of the one node holding this graph's shape and its identifier counter."""
+
         self.edge = f"`{graph_name(url).upper()}_EDGE`"
-        self._create_indexes()
+        try:
+            self._create_indexes()
+            self._seed_meta()
+        except Exception:
+            # A refused graph leaves no object to close, so its driver is released here.
+            self.driver.close()
+            raise
 
     def _create_indexes(self) -> None:
         with self.driver.session() as session:
             name = self.vertex.strip("`")
             session.run(f"CREATE INDEX `{name}_id` IF NOT EXISTS FOR (v:{self.vertex}) ON (v.id)")
             session.run(f"CREATE INDEX `{name}_edge` IF NOT EXISTS FOR ()-[e:{self.edge}]-() ON (e.id)")
+
+    def claim_edge_ids(self, count: int) -> int:
+        """Claims a run inside a write transaction, which both servers serialize on the meta node."""
+        self._seed_meta()
+        query = f"MATCH (m:{self.meta}) SET m.next_edge = m.next_edge + $count RETURN m.next_edge - $count AS first"
+        with self.driver.session() as session:
+            return session.execute_write(lambda transaction: transaction.run(query, count=count).single()["first"])
+
+    def raise_edge_floor(self, floor: int) -> None:
+        self._seed_meta()
+        query = (
+            f"MATCH (m:{self.meta}) SET m.next_edge = CASE WHEN m.next_edge < $floor THEN $floor ELSE m.next_edge END"
+        )
+        with self.driver.session() as session:
+            session.execute_write(lambda transaction: transaction.run(query, floor=floor).consume())
+
+    def _seed_meta(self) -> None:
+        """Writes the meta node on first use, and refuses a graph written as another shape."""
+        first = max(self.biggest_edge_id() + 1, FIRST_EDGE_ID)
+        query = f"""
+        MERGE (m:{self.meta} {{graph: 1}})
+        ON CREATE SET m.next_edge = $first, m.directed = $directed, m.multigraph = $multigraph
+        RETURN m.directed AS directed, m.multigraph AS multigraph
+        """
+        with self.driver.session() as session:
+            held = session.execute_write(
+                lambda transaction: transaction.run(
+                    query, first=first, directed=self.DIRECTED, multigraph=self.MULTIGRAPH
+                ).single()
+            )
+        if (held["directed"], held["multigraph"]) != (self.DIRECTED, self.MULTIGRAPH):
+            raise NetworkXternalError(
+                f"This graph was written as directed={held['directed']}, multigraph={held['multigraph']}, "
+                f"and is being opened as directed={self.DIRECTED}, multigraph={self.MULTIGRAPH}"
+            )
 
     def _loops(self, role: Role) -> str:
         """The second end a self-loop contributes to an undirected degree, which the pattern finds once."""
@@ -255,7 +301,8 @@ class Neo4JGraph(BaseGraph):
     def clear(self) -> None:
         with self.driver.session() as session:
             session.run(f"MATCH (v:{self.vertex}) CALL (v) {{ DETACH DELETE v }} IN TRANSACTIONS OF {BATCH} ROWS")
-        self.next_edge_id = None
+            session.run(f"MATCH (m:{self.meta}) SET m.next_edge = $first", first=FIRST_EDGE_ID)
+        self.forget_edge_ids()
 
     def close(self) -> None:
         self.driver.close()

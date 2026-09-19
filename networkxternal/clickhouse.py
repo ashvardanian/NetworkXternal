@@ -28,6 +28,7 @@ from networkxternal.base_api import (
     BaseMultiGraph,
     Cursor,
     EdgeLayout,
+    NetworkXternalError,
     Role,
     Triple,
 )
@@ -50,6 +51,11 @@ SCHEMA = (
     """,
     """
     CREATE MATERIALIZED VIEW IF NOT EXISTS edges_mirrored TO edges_by_target AS SELECT * FROM edges
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS graph_meta (
+        graph String, directed UInt8, multigraph UInt8, version UInt64
+    ) ENGINE = ReplacingMergeTree(version) ORDER BY graph
     """,
     """
     CREATE TABLE IF NOT EXISTS node_attributes (
@@ -83,6 +89,9 @@ class ClickHouseGraph(BaseGraph):
     QUERY_PAIRS = 512
     """How many pairs one query binds, an undirected lookup asking both orientations of each."""
 
+    SHARES_IDENTIFIERS = False
+    """No linearizable counter without Keeper, so one writer at a time; two would hand out one identifier."""
+
     CONCURRENT = False
     """A `clickhouse_connect` client runs one query per session, so a thread needs a client of its own."""
 
@@ -102,6 +111,35 @@ class ClickHouseGraph(BaseGraph):
         self.client.database = database
         for statement in SCHEMA:
             self.client.command(statement)
+        try:
+            self._seed_meta()
+        except Exception:
+            # A refused database leaves no object to close, so its client is released here.
+            self.client.close()
+            raise
+
+    GRAPH = "graph"
+    """The name the meta row is keyed by; one database holds one graph."""
+
+    def _seed_meta(self) -> None:
+        """Records the shape this graph was written as, and refuses a database written as another.
+
+        The counter stays in this process, since a versioned append cannot be claimed atomically.
+        """
+        held = self.client.query(
+            "SELECT directed, multigraph FROM graph_meta FINAL WHERE graph = {graph:String}",
+            parameters={"graph": self.GRAPH},
+        ).result_rows
+        if not held:
+            row = [[self.GRAPH, int(self.DIRECTED), int(self.MULTIGRAPH), self._version()]]
+            self.client.insert("graph_meta", row, column_names=["graph", "directed", "multigraph", "version"])
+            return
+        directed, multigraph = bool(held[0][0]), bool(held[0][1])
+        if (directed, multigraph) != (self.DIRECTED, self.MULTIGRAPH):
+            raise NetworkXternalError(
+                f"This database was written as directed={directed}, multigraph={multigraph}, "
+                f"and is being opened as directed={self.DIRECTED}, multigraph={self.MULTIGRAPH}"
+            )
 
     @staticmethod
     def _version() -> int:
@@ -307,9 +345,10 @@ class ClickHouseGraph(BaseGraph):
 
     def clear(self) -> None:
         """Truncation is the one removal a column store does cheaply, so clearing skips the tombstones."""
+        # The shape a graph was written as outlives its rows, so the meta table is not truncated.
         for table in ("nodes", "edges", "edges_by_target", "node_attributes", "edge_attributes"):
             self.client.command(f"TRUNCATE TABLE {table}")
-        self.next_edge_id = None
+        self.forget_edge_ids()
 
     def close(self) -> None:
         self.client.close()

@@ -16,6 +16,7 @@ import pymongo
 from pymongo import MongoClient, UpdateOne
 
 from networkxternal.base_api import (
+    FIRST_EDGE_ID,
     Attributes,
     AttributeStore,
     BaseDiGraph,
@@ -24,6 +25,7 @@ from networkxternal.base_api import (
     BaseMultiGraph,
     Cursor,
     EdgeLayout,
+    NetworkXternalError,
     Role,
     Triple,
     numeric_weight,
@@ -58,7 +60,47 @@ class MongoGraph(BaseGraph):
             AttributeStore.NODES: database["nodes_attributes"],
             AttributeStore.EDGES: database["edges_attributes"],
         }
-        self._create_indexes()
+        self.meta_collection = database["graph_meta"]
+        """One document holding the shape this graph was written as, and its identifier counter."""
+
+        try:
+            self._create_indexes()
+            self._seed_meta()
+        except Exception:
+            # A refused database leaves no object to close, so its client is released here.
+            self.client.close()
+            raise
+
+    GRAPH = "graph"
+    """The name the meta document is keyed by; one database holds one graph."""
+
+    def claim_edge_ids(self, count: int) -> int:
+        """An atomic increment, which is the one operation MongoDB guarantees without a transaction."""
+        self._seed_meta()
+        held = self.meta_collection.find_one_and_update(
+            {"_id": self.GRAPH},
+            {"$inc": {"next_edge": count}},
+            return_document=pymongo.ReturnDocument.BEFORE,
+        )
+        return held["next_edge"]
+
+    def raise_edge_floor(self, floor: int) -> None:
+        self._seed_meta()
+        self.meta_collection.update_one({"_id": self.GRAPH}, {"$max": {"next_edge": floor}})
+
+    def _seed_meta(self) -> None:
+        """Writes the meta document on first use, and refuses a database written as another shape."""
+        held = self.meta_collection.find_one({"_id": self.GRAPH})
+        if held is None:
+            first = max(self.biggest_edge_id() + 1, FIRST_EDGE_ID)
+            shape = {"directed": self.DIRECTED, "multigraph": self.MULTIGRAPH, "next_edge": first}
+            self.meta_collection.update_one({"_id": self.GRAPH}, {"$setOnInsert": shape}, upsert=True)
+            return
+        if (held["directed"], held["multigraph"]) != (self.DIRECTED, self.MULTIGRAPH):
+            raise NetworkXternalError(
+                f"This database was written as directed={held['directed']}, multigraph={held['multigraph']}, "
+                f"and is being opened as directed={self.DIRECTED}, multigraph={self.MULTIGRAPH}"
+            )
 
     def _create_indexes(self) -> None:
         """Compound indexes, so an adjacency read is answered from the index without touching a document."""
@@ -252,10 +294,11 @@ class MongoGraph(BaseGraph):
     def clear(self) -> None:
         self.edges_collection.drop()
         self.nodes_collection.drop()
+        self.meta_collection.update_one({"_id": self.GRAPH}, {"$set": {"next_edge": FIRST_EDGE_ID}})
         for collection in self.stores.values():
             collection.drop()
         self._create_indexes()
-        self.next_edge_id = None
+        self.forget_edge_ids()
 
     def close(self) -> None:
         self.client.close()
