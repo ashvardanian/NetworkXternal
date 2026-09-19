@@ -8,10 +8,10 @@ and a whole-graph delete has no batching clause.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from dataclasses import replace
 
 from networkxternal.base_api import BaseDiGraph, BaseMultiDiGraph, BaseMultiGraph, Role
-from networkxternal.neo4j import Neo4JGraph
+from networkxternal.neo4j import PATTERNS, CypherText, Neo4JGraph, Queries
 
 
 class MemgraphGraph(Neo4JGraph):
@@ -21,29 +21,34 @@ class MemgraphGraph(Neo4JGraph):
         super().__init__(url)
 
     def _create_indexes(self) -> None:
+        """The older declaration form, which is the one Memgraph takes."""
         with self.driver.session() as session:
             session.run(f"CREATE INDEX ON :{self.vertex}(id)")
             session.run(f"CREATE EDGE INDEX ON :{self.edge}(id)")
 
-    def degrees(self, nodes: Sequence[int], role: Role) -> list[int]:
-        """An aggregation rather than a subquery, and a self-loop counted at both of its ends."""
-        keys = list(nodes)
-        if not keys:
-            return []
-        # A self-loop is found once by an undirected pattern and contributes two ends; a directed role counts it once.
-        loops = " + count(CASE WHEN startNode(e) = endNode(e) THEN 1 END)" if role is Role.ANY else ""
-        query = f"""
-        UNWIND $keys AS key
-        MATCH {self._pattern(role)}
-        RETURN key AS key, count(e){loops} AS degree
-        """
-        with self.driver.session() as session:
-            counts = {record["key"]: record["degree"] for record in session.run(query, keys=keys)}
-        return [counts.get(key, 0) for key in keys]
+    def _build_queries(self) -> Queries:
+        """The same statements, with the three Memgraph spells differently rendered over them."""
+        labels = {"vertex": self.vertex, "edge": self.edge, "meta": self.meta}
+        held = super()._build_queries()
+        patterns = {role: CypherText(body).substitute(labels) for role, body in PATTERNS.items()}
+        # Memgraph has no `COUNT {}` subquery, and an undirected pattern finds a self-loop once.
+        degrees = {
+            role: (
+                "UNWIND $keys AS key MATCH "
+                + pattern
+                + " RETURN key AS key, count(e)"
+                + (" + count(CASE WHEN startNode(e) = endNode(e) THEN 1 END)" if role is Role.ANY else "")
+                + " AS degree"
+            )
+            for role, pattern in patterns.items()
+        }
+        # Nor a batched delete clause, so the whole graph goes in one transaction.
+        clear = CypherText("MATCH (v:%vertex) DETACH DELETE v").substitute(labels)
+        return replace(held, degrees=degrees, clear=clear)
 
     def clear_storage(self) -> None:
         with self.driver.session() as session:
-            session.run(f"MATCH (v:{self.vertex}) DETACH DELETE v")
+            session.run(self.queries.clear)
 
 
 class MemgraphDiGraph(MemgraphGraph, BaseDiGraph):

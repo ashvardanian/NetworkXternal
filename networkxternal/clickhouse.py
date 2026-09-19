@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator, Sequence
 from itertools import batched
+from string import Template
 from time import time_ns
 from urllib.parse import urlparse
 
@@ -32,6 +33,30 @@ from networkxternal.base_api import (
     Triple,
     per_key,
 )
+
+
+class ClickHouseText(Template):
+    """ClickHouse text with the tables left to fill in, taking `%name` so `{name:Type}` stays a parameter."""
+
+    delimiter = "%"
+
+
+ADJACENT = ClickHouseText(
+    "SELECT source, target, edge FROM %table FINAL "
+    "WHERE %column IN {keys:Array(UInt64)} AND is_deleted = 0 ORDER BY %column, edge"
+)
+"""Every edge incident to a batch of vertices, from the table ordered by the end being looked up."""
+
+DEGREES = ClickHouseText(
+    "SELECT %column AS end, count() AS degree FROM %table FINAL "
+    "WHERE %column IN {keys:Array(UInt64)} AND is_deleted = 0 GROUP BY end"
+)
+"""How many edge ends a batch of vertices holds, counted by the engine."""
+
+READ_DOCUMENTS = ClickHouseText(
+    "SELECT %column, document FROM %table FINAL WHERE %column IN {keys:Array(UInt64)} AND is_deleted = 0"
+)
+"""The attribute document of a batch of keys."""
 
 SCHEMA = (
     """
@@ -221,10 +246,7 @@ class ClickHouseGraph(BaseGraph):
             return
         loops: set[Triple] = set()
         for table, column in self._tables_for(role):
-            query = f"""
-            SELECT source, target, edge FROM {table} FINAL
-            WHERE {column} IN {{keys:Array(UInt64)}} AND is_deleted = 0 ORDER BY {column}, edge
-            """
+            query = ADJACENT.substitute(table=table, column=column)
             for page in batched(keys, self.QUERY_KEYS):
                 yield from self._adjacent_page(query, list(page), column, role, loops)
 
@@ -269,11 +291,7 @@ class ClickHouseGraph(BaseGraph):
             return []
         counts = dict.fromkeys(keys, 0)
         for table, column in self._tables_for(role):
-            query = f"""
-            SELECT {column} AS end, count() AS degree FROM {table} FINAL
-            WHERE {column} IN {{keys:Array(UInt64)}} AND is_deleted = 0
-            GROUP BY end
-            """
+            query = DEGREES.substitute(table=table, column=column)
             for page in batched(keys, self.QUERY_KEYS):
                 for end, degree in self.client.query(query, parameters={"keys": list(page)}).result_rows:
                     if end in counts:
@@ -312,10 +330,7 @@ class ClickHouseGraph(BaseGraph):
         if not keys:
             return []
         table, column = self._attributes_table(store)
-        query = f"""
-        SELECT {column}, document FROM {table} FINAL
-        WHERE {column} IN {{keys:Array(UInt64)}} AND is_deleted = 0
-        """
+        query = READ_DOCUMENTS.substitute(table=table, column=column)
         found: dict[int, Attributes] = {}
         for page in batched(keys, self.QUERY_KEYS):
             rows = self.client.query(query, parameters={"keys": list(page)}).result_rows
