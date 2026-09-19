@@ -14,7 +14,9 @@ from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from heapq import heappop, heappush
 from itertools import batched, compress, islice
+from math import inf
 
 from networkxternal.base_api import BaseGraph, DegreeView, Role, Triple
 
@@ -51,6 +53,24 @@ def adjacency(graph: BaseGraph, nodes: Iterable[int], role: Role) -> Iterator[tu
     """Yields `(vertex, neighbour, edge)` for every edge incident to `nodes`, one page of rows at a time."""
     for node, (source, target, edge) in graph.adjacent_edges(list(nodes), role):
         yield node, (target if source == node else source), edge
+
+
+def weighted_adjacency(
+    graph: BaseGraph, nodes: Iterable[int], role: Role, weight: str | None
+) -> Iterator[tuple[int, int, float]]:
+    """Yields `(vertex, neighbour, weight)` for every incident edge, one page of weights at a time.
+
+    With `weight` unset every edge counts as one and no attribute is read, which is decided here
+    rather than inside the loop.
+    """
+    for page in batched(graph.adjacent_edges(list(nodes), role), graph.PAGE):
+        reached = [(node, target if source == node else source) for node, (source, target, _) in page]
+        if weight is None:
+            yield from ((node, other, 1.0) for node, other in reached)
+            continue
+        weights = graph.edge_weights([edge for _, (_, _, edge) in page], weight)
+        for (node, other), held in zip(reached, weights, strict=True):
+            yield node, other, 1.0 if held is None else held
 
 
 def scan_unit_edges(graph: BaseGraph) -> Iterator[tuple[int, int, float]]:
@@ -163,6 +183,80 @@ def neighbors_of_neighbors(graph: BaseGraph, node: int, reach: Reach = Reach.SEC
 
 
 # endregion Traversal
+
+# region Weighted Paths
+
+
+def dijkstra_lengths(
+    graph: BaseGraph,
+    source: int,
+    weight: str | None = "weight",
+    cutoff: float | None = None,
+) -> dict[int, float]:
+    """The weight of the lightest path from `source` to every vertex it reaches.
+
+    One adjacency lookup per settled vertex, which is a round trip per vertex and the reason
+    `delta_stepping_lengths` exists: this walk is the reference, not the one for a large graph.
+
+    Bound: 16 bytes per vertex in the heap and the distances, 68 per vertex in the answer.
+    """
+    settled: dict[int, float] = {}
+    frontier = [(0.0, source)]
+    while frontier:
+        held, node = heappop(frontier)
+        if node in settled:
+            continue
+        settled[node] = held
+        for _, other, along in weighted_adjacency(graph, [node], graph.outgoing_role, weight):
+            reached = held + along
+            if other not in settled and (cutoff is None or reached <= cutoff):
+                heappush(frontier, (reached, other))
+    return settled
+
+
+def delta_stepping_lengths(
+    graph: BaseGraph,
+    source: int,
+    weight: str | None = "weight",
+    delta: float = 1.0,
+    cutoff: float | None = None,
+) -> dict[int, float]:
+    """The same answer as `dijkstra_lengths`, in rounds that each read one batch of adjacency.
+
+    Vertices are bucketed by distance over `delta`, and a round relaxes a whole bucket in one lookup,
+    so the cost is a round trip per bucket rather than per vertex — and the relaxations inside a
+    bucket are independent, which is what makes this the shape a parallel run would take.
+
+    Bound: 16 bytes per vertex across the distances and the buckets, 68 per vertex in the answer.
+    """
+    settled: dict[int, float] = {source: 0.0}
+    buckets: dict[int, set[int]] = {0: {source}}
+    index = 0
+    while buckets:
+        index = min(buckets)
+        wave = buckets.pop(index)
+        while wave:
+            reached: dict[int, float] = {}
+            for node, other, along in weighted_adjacency(graph, wave, graph.outgoing_role, weight):
+                candidate = settled[node] + along
+                if cutoff is not None and candidate > cutoff:
+                    continue
+                if candidate < settled.get(other, inf) and candidate < reached.get(other, inf):
+                    reached[other] = candidate
+            wave = set()
+            for other, candidate in reached.items():
+                if candidate >= settled.get(other, inf):
+                    continue
+                settled[other] = candidate
+                into = int(candidate // delta)
+                if into == index:
+                    wave.add(other)
+                else:
+                    buckets.setdefault(into, set()).add(other)
+    return settled
+
+
+# endregion Weighted Paths
 
 # region Components
 
@@ -431,6 +525,8 @@ BOUNDS = {
     "degree_histogram": Bounds(retained_per_vertex=0, working_per_vertex=0, passes="one"),
     "sample_nodes": Bounds(retained_per_vertex=0, working_per_vertex=0, passes="one"),
     "sample_edges": Bounds(retained_per_vertex=0, working_per_vertex=0, passes="one"),
+    "dijkstra_lengths": Bounds(retained_per_vertex=68, working_per_vertex=16, passes="per settled vertex"),
+    "delta_stepping_lengths": Bounds(retained_per_vertex=68, working_per_vertex=16, passes="per bucket"),
 }
 """What each algorithm holds and how often it reads the graph, which `test/bounds.py` measures.
 
