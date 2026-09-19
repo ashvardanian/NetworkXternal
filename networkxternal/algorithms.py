@@ -18,7 +18,7 @@ from heapq import heappop, heappush
 from itertools import batched, compress, islice
 from math import inf
 
-from networkxternal.base_api import BaseGraph, DegreeView, Role, Triple
+from networkxternal.base_api import BaseGraph, DegreeView, NetworkXternalError, Role, Triple
 
 
 @dataclass(frozen=True)
@@ -309,6 +309,93 @@ def connected_components(graph: BaseGraph) -> dict[int, int]:
 
 # endregion Components
 
+# region Directed Structure
+
+
+def reachable_within(graph: BaseGraph, sources: set[int], role: Role, allowed: set[int]) -> set[int]:
+    """Every vertex of `allowed` reachable from `sources` along edges in that role, layer by layer."""
+    reached = set(sources)
+    frontier = set(sources)
+    while frontier:
+        beyond = {
+            other for _, other, _ in adjacency(graph, frontier, role) if other in allowed and other not in reached
+        }
+        reached |= beyond
+        frontier = beyond
+    return reached
+
+
+def weakly_connected_components(graph: BaseGraph) -> dict[int, int]:
+    """The weak component every vertex belongs to, which ignores the direction of every edge.
+
+    Bound: 24 bytes per vertex while it runs, 68 per vertex in the answer, one pass over the edges.
+    """
+    return connected_components(graph)
+
+
+def strongly_connected_components(graph: BaseGraph) -> dict[int, int]:
+    """The strong component every vertex belongs to, named by the smallest vertex in it.
+
+    Forward-backward: a pivot's descendants and its ancestors intersect in its own component, and the
+    three remainders are independent of each other and of it. Each side is a layered traversal, so the
+    cost is a round trip per layer rather than the recursion depth a depth-first search would need.
+
+    Bound: 32 bytes per vertex across the pending sets, 68 per vertex in the answer, two traversals
+    per pivot round and about log V rounds on a graph whose components are not pathological.
+    """
+    labels: dict[int, int] = {}
+    pending = [set(graph.scan_nodes())]
+    while pending:
+        held = pending.pop()
+        if not held:
+            continue
+        if len(held) == 1:
+            node = held.pop()
+            labels[node] = node
+            continue
+        pivot = min(held)
+        forward = reachable_within(graph, {pivot}, Role.SOURCE, held)
+        backward = reachable_within(graph, {pivot}, Role.TARGET, held)
+        component = forward & backward
+        name = min(component)
+        labels.update(dict.fromkeys(component, name))
+        pending.append(forward - component)
+        pending.append(backward - component)
+        pending.append(held - forward - backward)
+    return labels
+
+
+def topological_order(graph: BaseGraph) -> list[int]:
+    """Every vertex before the ones its edges lead to, or the empty list where a cycle forbids it.
+
+    Kahn's method over an in-degree array: one edge pass to build it, then one adjacency lookup per
+    layer of vertices whose incoming edges have all been taken.
+
+    Bound: 16 bytes per vertex across the degrees and the frontier, 8 per vertex in the answer, one
+    pass over the edges and one adjacency lookup per layer.
+    """
+    if not graph.is_directed():
+        raise NetworkXternalError("An undirected graph has no topological order")
+    order = DenseIndex(graph.scan_nodes())
+    incoming = array("q", [0]) * len(order)
+    for _, target, _ in graph.scan_edges():
+        incoming[order[target]] += 1
+    ordered: list[int] = []
+    frontier = {node for node in order if not incoming[order[node]]}
+    while frontier:
+        ordered.extend(sorted(frontier))
+        beyond: set[int] = set()
+        for _, other, _ in adjacency(graph, frontier, Role.SOURCE):
+            position = order[other]
+            incoming[position] -= 1
+            if not incoming[position]:
+                beyond.add(other)
+        frontier = beyond
+    return ordered if len(ordered) == len(order) else []
+
+
+# endregion Directed Structure
+
 # region PageRank
 
 
@@ -527,6 +614,9 @@ BOUNDS = {
     "sample_edges": Bounds(retained_per_vertex=0, working_per_vertex=0, passes="one"),
     "dijkstra_lengths": Bounds(retained_per_vertex=68, working_per_vertex=16, passes="per settled vertex"),
     "delta_stepping_lengths": Bounds(retained_per_vertex=68, working_per_vertex=16, passes="per bucket"),
+    "weakly_connected_components": Bounds(retained_per_vertex=68, working_per_vertex=24, passes="one"),
+    "strongly_connected_components": Bounds(retained_per_vertex=68, working_per_vertex=32, passes="per round"),
+    "topological_order": Bounds(retained_per_vertex=8, working_per_vertex=16, passes="per layer"),
 }
 """What each algorithm holds and how often it reads the graph, which `test/bounds.py` measures.
 
