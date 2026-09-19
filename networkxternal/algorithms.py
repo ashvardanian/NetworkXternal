@@ -13,7 +13,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from enum import StrEnum
 from itertools import batched
 
-from networkxternal.base_api import AttributeStore, BaseGraph, DegreeView, Role, Triple
+from networkxternal.base_api import BaseGraph, DegreeView, Role, Triple
 
 BOTTOM_UP_FRACTION = 0.1
 """The share of the vertex count a frontier must pass before a layer is found by scanning every edge instead."""
@@ -38,11 +38,15 @@ def scan_unit_edges(graph: BaseGraph) -> Iterator[tuple[int, int, float]]:
 
 
 def scan_weighted_edges(graph: BaseGraph, weight: str) -> Iterator[tuple[int, int, float]]:
-    """Yields `(source, target, weight)` for every stored edge, holding one page of documents at a time."""
+    """Yields `(source, target, weight)` for every stored edge, a page of weights at a time.
+
+    The weight comes through `edge_weights`, which a store holding it in a typed column answers from
+    that column rather than by parsing a document per edge.
+    """
     for page in batched(graph.scan_edges(), graph.PAGE):
-        documents = graph.read_documents(AttributeStore.EDGES, [edge for _, _, edge in page])
-        for (source, target, _), found in zip(page, documents, strict=True):
-            yield source, target, float(found.get(weight, 1))
+        weights = graph.edge_weights([edge for _, _, edge in page], weight)
+        for (source, target, _), held in zip(page, weights, strict=True):
+            yield source, target, 1.0 if held is None else held
 
 
 def mirrored(stream: Iterable[tuple[int, int, float]]) -> Iterator[tuple[int, int, float]]:

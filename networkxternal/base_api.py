@@ -170,10 +170,10 @@ class DegreeView:
         yield from ((node, totals[node]) for node in nodes)
 
     def _add_weights(self, totals: dict[int, float], page: Sequence[tuple[int, Triple]]) -> None:
-        """Adds one page of incident edges to the running totals, reading their documents in one call."""
-        attributes = self.graph.read_documents(AttributeStore.EDGES, [edge for _, (_, _, edge) in page])
-        for (node, (source, target, _)), found in zip(page, attributes, strict=True):
-            weight = found.get(self.weight, 1)
+        """Adds one page of incident edges to the running totals, reading their weights in one call."""
+        weights = self.graph.edge_weights([edge for _, (_, _, edge) in page], self.weight)
+        for (node, (source, target, _)), held in zip(page, weights, strict=True):
+            weight = 1 if held is None else held
             # NetworkX counts an undirected self-loop at both of its ends.
             totals[node] += weight * 2 if source == target and self.role is Role.ANY else weight
 

@@ -104,6 +104,10 @@ class ClickHouseGraph(BaseGraph):
             port=address.port or 8123,
             username=address.username or "default",
             password=address.password or "",
+            # Zero means as many threads as the server has, which is where a `FINAL` read spends itself.
+            # Asynchronous inserts stay off: the simple-graph path reads its own writes back before it
+            # allocates, and an insert that has not landed yet would hand out a second edge for one pair.
+            settings={"max_threads": 0},
         )
         if not database.replace("-", "_").isidentifier():
             raise ValueError(f"A database name must be a plain identifier, got {database!r}")
