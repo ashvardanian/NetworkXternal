@@ -6,13 +6,18 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from enum import StrEnum
 from itertools import batched, islice, repeat
+from operator import itemgetter
 from threading import Lock
 from typing import Any, ClassVar
+from urllib.parse import urlparse
 
 type Attributes = dict[str, Any]
 type Triple = tuple[int, int, int]
 type NodeBunch = int | Iterable[int] | None
 type Cursor = Triple | None
+
+EMPTY_DOCUMENT: Attributes = {}
+"""The document an edge carries when the caller named none, shared because nothing writes to it."""
 
 FIRST_EDGE_ID = 1
 """The edge identifier a graph starts handing out from."""
@@ -20,6 +25,11 @@ FIRST_EDGE_ID = 1
 
 class NetworkXternalError(Exception):
     """Raised where NetworkX raises `NetworkXError`: a vertex or edge the graph does not hold."""
+
+
+def path_head(url: str, default: str) -> str:
+    """The first segment of a connection string's path, which every backend names its graph by."""
+    return urlparse(url).path.lstrip("/").partition("/")[0] or default
 
 
 def numeric_weight(value: Any) -> float | None:
@@ -549,13 +559,11 @@ class BaseGraph(ABC):
             upsert_sources, upsert_targets, upsert_edges = zip(*upserted, strict=True)
             self.upsert_edges(upsert_sources, upsert_targets, upsert_edges)
         if attributes or columns or entries:
+            named = list((columns or {}).items())
+            own = entries or repeat(EMPTY_DOCUMENT)
             per_edge = [
-                {
-                    **attributes,
-                    **{name: values[index] for name, values in (columns or {}).items()},
-                    **((entries or [{}] * len(identifiers))[index]),
-                }
-                for index in range(len(identifiers))
+                {**attributes, **{name: values[index] for name, values in named}, **held}
+                for index, held in zip(range(len(identifiers)), own, strict=False)
             ]
             shared = not columns and not entries
             self.merge_documents(AttributeStore.EDGES, identifiers, per_edge[:1] if shared else per_edge)
@@ -617,13 +625,15 @@ class BaseGraph(ABC):
         taken: set[Triple] = set()
         for position, key in enumerate(wanted):
             remaining = [triple for triple in stored[position] if triple not in taken]
+            first = len(removed)
             if not self.MULTIGRAPH:
                 removed.extend(remaining)
             elif key is not None:
                 removed.extend(triple for triple in remaining if triple[2] == key)
             elif remaining:
-                removed.append(max(remaining, key=lambda triple: triple[2]))
-            taken.update(removed)
+                removed.append(max(remaining, key=itemgetter(2)))
+            # Only what this pair took, since the rest is already spoken for.
+            taken.update(removed[first:])
         if removed:
             removed_sources, removed_targets, removed_edges = zip(*removed, strict=True)
             self.drop_edges(removed_sources, removed_targets, removed_edges)

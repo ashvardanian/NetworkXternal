@@ -37,7 +37,12 @@ class Target:
     def open(self, dataset: str):
         """Opens the graph this target names, for one dataset, creating the directory a local store needs."""
         url = os.getenv(self.variable, self.url).replace("{dataset}", dataset)
-        local = url.removeprefix("sqlite:///") if url.startswith("sqlite:///") else url if "://" not in url else None
+        if url.startswith("sqlite:///"):
+            local = url.removeprefix("sqlite:///")
+        elif "://" in url:
+            local = None
+        else:
+            local = url
         if local is not None:
             Path(local).parent.mkdir(parents=True, exist_ok=True)
         return getattr(import_module(self.module), self.graph)(url, **self.extras)

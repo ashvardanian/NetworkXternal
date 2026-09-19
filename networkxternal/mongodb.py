@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
 from itertools import batched
-from urllib.parse import urlparse
 
 import pymongo
 from pymongo import MongoClient, UpdateOne
@@ -29,14 +28,14 @@ from networkxternal.base_api import (
     Triple,
     ends_asked,
     numeric_weight,
+    path_head,
     per_key,
 )
 
 
 def database_name(url: str, default: str = "graph") -> str:
     """The database a connection string addresses, or `default` when it names none."""
-    parts = [part for part in urlparse(url).path.split("/") if part]
-    return parts[0].lower() if parts else default
+    return path_head(url, default).lower()
 
 
 class MongoGraph(BaseGraph):

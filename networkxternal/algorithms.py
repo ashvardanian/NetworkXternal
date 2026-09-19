@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import random
 from array import array
+from bisect import bisect_left
+from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from enum import StrEnum
-from itertools import batched
+from itertools import batched, compress, islice
 
 from networkxternal.base_api import BaseGraph, DegreeView, Role, Triple
 
@@ -232,12 +234,14 @@ def pagerank(
     share = 1.0 / count
     ranks = array("d", [share]) * count
     scale = outgoing_scale(graph, order, weight)
+    # Which vertices lead nowhere never changes, so the sum below walks only those.
+    dangling_at = [position for position, spread in enumerate(scale) if not spread]
     for _ in range(iterations):
         pushed = array("d", [0.0]) * count
         for source, target, held in scan_arcs(graph, weight):
             position = order[source]
             pushed[order[target]] += ranks[position] * held * scale[position]
-        dangling = sum(rank for rank, spread in zip(ranks, scale, strict=True) if not spread)
+        dangling = sum(map(ranks.__getitem__, dangling_at))
         leaked = damping * dangling * share + (1.0 - damping) * share
         if settle_ranks(ranks, pushed, damping, leaked) < count * tolerance:
             break
@@ -301,9 +305,9 @@ def core_numbers(graph: BaseGraph) -> dict[int, int]:
     level = 0
     remaining = count
     while remaining:
-        level = max(level, min(degrees[index] for index in range(count) if alive[index]))
+        level = max(level, min(compress(degrees, alive)))
         peeled = peel_below(degrees, alive, cores, level)
-        remaining -= sum(peeled)
+        remaining -= peeled.count(1)
         lower_across_peeled(graph, order, degrees, peeled)
     return {node: cores[index] for node, index in order.items()}
 
@@ -359,14 +363,15 @@ def shared_count(left: Sequence[int], right: Sequence[int]) -> int:
 
 
 def accumulate_shared(starts: array, ends: array, neighbours: array, counts: array) -> None:
-    """Adds to both ends of every edge how many neighbours the two ends share, run against sorted run."""
+    """Adds to both ends of every edge how many neighbours the two ends share, run against sorted run.
+
+    Each run is sorted, so the neighbours below the vertex itself are skipped by a search rather than
+    one at a time — every unordered pair is then visited exactly once.
+    """
     runs = memoryview(neighbours)
     for index in range(len(counts)):
         run = runs[starts[index] : ends[index]]
-        for position in range(starts[index], ends[index]):
-            other = neighbours[position]
-            if other < index:
-                continue
+        for other in run[bisect_left(run, index) :]:
             shared = shared_count(run, runs[starts[other] : ends[other]])
             counts[index] += shared
             counts[other] += shared
@@ -391,40 +396,34 @@ def triangle_counts(graph: BaseGraph, nodes: Iterable[int] | None = None) -> dic
 # region Sampling
 
 
-def degree_histogram(graph: BaseGraph, role: Role = Role.ANY) -> dict[int, int]:
+def degree_histogram(graph: BaseGraph, role: Role = Role.ANY) -> Counter[int]:
     """How many vertices hold each degree, streamed rather than sorted into a list."""
-    histogram: dict[int, int] = {}
-    for _, degree in DegreeView(graph, role):
-        histogram[degree] = histogram.get(degree, 0) + 1
-    return histogram
+    return Counter(degree for _, degree in DegreeView(graph, role))
+
+
+def reservoir[Item](stream: Iterable[Item], count: int, seed: int | None) -> list[Item]:
+    """A uniform sample of `count` items over one pass, holding the reservoir and nothing else.
+
+    The reservoir fills before the loop, so the walk carries no test for whether it is full yet.
+    """
+    generator = random.Random(seed)
+    walk = iter(stream)
+    held = list(islice(walk, count))
+    for seen, item in enumerate(walk, start=count):
+        index = generator.randrange(seen + 1)
+        if index < count:
+            held[index] = item
+    return held
 
 
 def sample_nodes(graph: BaseGraph, count: int, seed: int | None = None) -> list[int]:
-    """A uniform sample of `count` vertices, reservoir-sampled over one pass of the vertex scan."""
-    generator = random.Random(seed)
-    reservoir: list[int] = []
-    for seen, node in enumerate(graph.scan_nodes()):
-        if len(reservoir) < count:
-            reservoir.append(node)
-            continue
-        index = generator.randrange(seen + 1)
-        if index < count:
-            reservoir[index] = node
-    return reservoir
+    """A uniform sample of `count` vertices, over one pass of the vertex scan."""
+    return reservoir(graph.scan_nodes(), count, seed)
 
 
 def sample_edges(graph: BaseGraph, count: int, seed: int | None = None) -> list[Triple]:
-    """A uniform sample of `count` edges, reservoir-sampled over one pass of the edge stream."""
-    generator = random.Random(seed)
-    reservoir: list[Triple] = []
-    for seen, triple in enumerate(graph.scan_edges()):
-        if len(reservoir) < count:
-            reservoir.append(triple)
-            continue
-        index = generator.randrange(seen + 1)
-        if index < count:
-            reservoir[index] = triple
-    return reservoir
+    """A uniform sample of `count` edges, over one pass of the edge stream."""
+    return reservoir(graph.scan_edges(), count, seed)
 
 
 def relabel_dense(nodes: Sequence[int]) -> dict[int, int]:

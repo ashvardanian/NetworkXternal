@@ -166,12 +166,15 @@ SYNTHETIC = (
 """Generated graphs for a smoke test, whose skew is a hub stress case rather than a realistic one."""
 
 
+BY_NAME = {entry.name: entry for entry in CATALOGUE}
+"""Every catalogued graph by its name, so a lookup is a lookup."""
+
+
 def find(name: str) -> Catalogued:
     """The catalogue entry a name addresses."""
-    for entry in CATALOGUE:
-        if entry.name == name:
-            return entry
-    raise KeyError(f"No catalogued dataset is named {name!r}; known: {', '.join(e.name for e in CATALOGUE)}")
+    if name not in BY_NAME:
+        raise KeyError(f"No catalogued dataset is named {name!r}; known: {', '.join(BY_NAME)}")
+    return BY_NAME[name]
 
 
 def download(name: str) -> Path:

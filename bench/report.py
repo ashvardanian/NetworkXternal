@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -56,8 +57,10 @@ def table_of(rows: list[Measurement], cell: Callable[[Measurement], str]) -> lis
     """One table of the given rows, workloads down the side and stores across the top."""
     targets = list(dict.fromkeys(entry.target for entry in rows))
     lines = ["| Workload | " + " | ".join(targets) + " |", "| :--- | " + " | ".join("---:" for _ in targets) + " |"]
-    for workload in dict.fromkeys(entry.workload for entry in rows):
-        found = {entry.target: entry for entry in rows if entry.workload == workload}
+    by_workload: defaultdict[str, dict[str, Measurement]] = defaultdict(dict)
+    for entry in rows:
+        by_workload[entry.workload][entry.target] = entry
+    for workload, found in by_workload.items():
         lines.append(f"| {workload} | " + " | ".join(cell(found[t]) if t in found else "—" for t in targets) + " |")
     lines.append("")
     return lines

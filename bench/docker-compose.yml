@@ -59,6 +59,8 @@ services:
     environment:
       CLICKHOUSE_USER: graph
       CLICKHOUSE_PASSWORD: graph
+    volumes:
+      - ./clickhouse-benchmark.xml:/etc/clickhouse-server/config.d/benchmark.xml:ro
     tmpfs: ["/var/lib/clickhouse:size=1g"]
 
   # The JVM sizes its heap from what the host reports, not from the cgroup, so both are set here.

@@ -31,6 +31,7 @@ from networkxternal.base_api import (
     NetworkXternalError,
     Role,
     Triple,
+    path_head,
     per_key,
 )
 
@@ -124,7 +125,7 @@ class ClickHouseGraph(BaseGraph):
     def __init__(self, url: str = "clickhouse://graph:graph@localhost:8123/graph") -> None:
         super().__init__()
         address = urlparse(url)
-        database = address.path.strip("/") or "graph"
+        database = path_head(url, "graph")
         self.client = clickhouse_connect.get_client(
             host=address.hostname or "localhost",
             port=address.port or 8123,

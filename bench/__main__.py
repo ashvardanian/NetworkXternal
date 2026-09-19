@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import os
 import tracemalloc
+from itertools import batched, islice
 from pathlib import Path
 from time import perf_counter
 
@@ -73,16 +74,10 @@ def load(graph: BaseGraph, dataset: Dataset, budget: Budget) -> tuple[int, float
     """
     started = perf_counter()
     imported = 0
-    page: list[tuple[int, int, float | None]] = []
-    for edge in dataset.stream():
-        page.append(edge)
-        if len(page) < graph.PAGE:
-            continue
-        imported += write_page(graph, page)
-        page = []
+    for page in batched(dataset.stream(), graph.PAGE):
+        imported += write_page(graph, list(page))
         if budget.expired():
-            return imported, perf_counter() - started
-    imported += write_page(graph, page)
+            break
     return imported, perf_counter() - started
 
 
@@ -98,13 +93,8 @@ def write_page(graph: BaseGraph, page: list[tuple[int, int, float | None]]) -> i
 
 
 def sample_of(dataset: Dataset, count: int) -> list[tuple[int, int, float | None]]:
-    """The edges every query workload reuses, taken from the head of the stream so each store sees the same ones."""
-    sample: list[tuple[int, int, float | None]] = []
-    for edge in dataset.stream():
-        sample.append(edge)
-        if len(sample) == count:
-            break
-    return sample
+    """The edges every query workload reuses, from the head of the stream so each store sees the same ones."""
+    return list(islice(dataset.stream(), count))
 
 
 def measure(

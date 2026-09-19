@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import gzip
-from collections.abc import Iterator
-from itertools import batched
+from collections.abc import Iterable, Iterator
+from itertools import batched, chain
 from pathlib import Path
 from typing import IO
 
@@ -25,18 +25,26 @@ def yield_edges(path: str | Path) -> Iterator[WeightedEdge]:
     fields are not integers is skipped — which is how a header, a blank line and a preamble all go.
     """
     with open_text(path) as handle:
-        for line in handle:
-            if line.startswith(("#", "%")):
-                continue
-            fields = line.replace(",", " ").split()
-            if len(fields) < 2:
-                continue
-            try:
-                source, target = int(fields[0]), int(fields[1])
-                weight = float(fields[2]) if len(fields) > 2 else None
-            except ValueError:
-                continue
-            yield source, target, weight
+        rows = (line for line in handle if not line.startswith(("#", "%")))
+        for first in rows:
+            # A whole file uses one separator, so it is decided here rather than tested per line.
+            separator = "," if "," in first else None
+            yield from parse_rows(chain([first], rows), separator)
+            return
+
+
+def parse_rows(rows: Iterable[str], separator: str | None) -> Iterator[WeightedEdge]:
+    """Yields the edges of already-filtered rows, splitting each into at most three fields."""
+    for line in rows:
+        fields = line.split(separator, 2)
+        if len(fields) < 2:
+            continue
+        try:
+            source, target = int(fields[0]), int(fields[1])
+            weight = float(fields[2].split(separator)[0]) if len(fields) > 2 and fields[2].strip() else None
+        except ValueError:
+            continue
+        yield source, target, weight
 
 
 def import_edges(graph: BaseGraph, path: str | Path, weight: str = "weight") -> int:

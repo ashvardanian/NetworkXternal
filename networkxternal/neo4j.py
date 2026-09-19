@@ -31,6 +31,7 @@ from networkxternal.base_api import (
     NetworkXternalError,
     Role,
     Triple,
+    path_head,
     per_key,
 )
 
@@ -137,8 +138,7 @@ class Queries:
 
 def graph_name(url: str, default: str = "Graph") -> str:
     """The label a connection string names; a backtick would end the quoting the label is written in."""
-    parts = [part for part in urlparse(url).path.split("/") if part]
-    name = parts[0] if parts else default
+    name = path_head(url, default)
     if "`" in name:
         raise ValueError(f"A graph name may not hold a backtick, got {name!r}")
     return name[0].upper() + name[1:]
