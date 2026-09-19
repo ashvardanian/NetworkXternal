@@ -782,6 +782,8 @@ BOUNDS = {
     "hits": Bounds(retained_per_vertex=184, working_per_vertex=40, passes="per sweep"),
     "personalized_pagerank": Bounds(retained_per_vertex=92, working_per_vertex=40, passes="per sweep"),
     "betweenness_centrality": Bounds(retained_per_vertex=92, working_per_vertex=32, passes="per layer"),
+    "clustering_coefficients": Bounds(retained_per_vertex=92, working_per_vertex=32, passes="two"),
+    "label_propagation": Bounds(retained_per_vertex=68, working_per_vertex=8, passes="per sweep"),
 }
 """What each algorithm holds and how often it reads the graph, which `test/bounds.py` measures.
 
@@ -791,6 +793,82 @@ walk itself uses — so on a graph too large for that, ask for the array form ra
 
 # endregion Bounds
 
+
+# region Communities
+
+
+def clustering_coefficients(graph: BaseGraph, nodes: Iterable[int] | None = None) -> dict[int, float]:
+    """How close each vertex's neighbours are to being a clique, as `networkx.clustering` answers it.
+
+    The triangles are counted once and the degrees come from the engine, so this costs what
+    `triangle_counts` costs and nothing beyond it.
+
+    Bound: as `triangle_counts`, plus 8 bytes per vertex for the degrees, and 92 per vertex answered.
+    """
+    triangles = triangle_counts(graph, nodes)
+    wanted = list(triangles)
+    degrees = graph.degrees(wanted, Role.ANY)
+    coefficients: dict[int, float] = {}
+    for node, degree, closed in zip(wanted, degrees, (triangles[node] for node in wanted), strict=True):
+        pairs = degree * (degree - 1)
+        coefficients[node] = 2.0 * closed / pairs if pairs else 0.0
+    return coefficients
+
+
+def label_propagation(graph: BaseGraph, iterations: int = 32) -> dict[int, int]:
+    """The community every vertex belongs to, by taking the label most of its neighbours carry.
+
+    One edge pass per sweep, with ties broken by the smallest label so two runs answer the same thing.
+    A sweep that changes nothing ends the walk; `iterations` caps a graph that keeps oscillating.
+
+    Bound: 8 bytes per vertex in the labels, 68 per vertex in the answer, one pass per sweep.
+    """
+    order = DenseIndex(graph.scan_nodes())
+    labels = array("q", order.nodes)
+    for _ in range(iterations):
+        tallies: dict[int, Counter[int]] = {}
+        for source, target, _ in scan_arcs(graph, None):
+            tallies.setdefault(target, Counter())[labels[order[source]]] += 1
+        changed = False
+        for node, counted in tallies.items():
+            best = min(counted.items(), key=lambda held: (-held[1], held[0]))[0]
+            position = order[node]
+            if labels[position] != best:
+                labels[position] = best
+                changed = True
+        if not changed:
+            break
+    return {node: labels[index] for node, index in order.items()}
+
+
+def edge_supports(graph: BaseGraph, kept: set[Triple]) -> dict[Triple, int]:
+    """How many triangles each kept edge takes part in, from the adjacency of the kept edges alone."""
+    neighbours: dict[int, set[int]] = {}
+    for source, target, _ in kept:
+        neighbours.setdefault(source, set()).add(target)
+        neighbours.setdefault(target, set()).add(source)
+    return {(source, target, edge): len(neighbours[source] & neighbours[target]) for source, target, edge in kept}
+
+
+def k_truss(graph: BaseGraph, k: int) -> set[Triple]:
+    """Every edge whose ends share at least `k - 2` neighbours once the weaker edges are gone.
+
+    Peeled a round at a time: the edges below the support are dropped, the supports recomputed, and
+    the round repeats until nothing falls. This is the one algorithm here holding state per edge, and
+    it says so.
+
+    Bound: 8 bytes per edge in the supports, one pass over the edges per peeling round.
+    """
+    kept = {triple for triple in graph.scan_edges() if triple[0] != triple[1]}
+    while True:
+        supports = edge_supports(graph, kept)
+        weak = {triple for triple, support in supports.items() if support < k - 2}
+        if not weak:
+            return kept
+        kept -= weak
+
+
+# endregion Communities
 
 # region Sampling
 
