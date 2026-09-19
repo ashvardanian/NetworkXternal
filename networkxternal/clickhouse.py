@@ -142,11 +142,17 @@ class ClickHouseGraph(BaseGraph):
         )
 
     def drop_nodes(self, nodes: Sequence[int]) -> None:
+        """Tombstones the vertices and every edge they take part in, which costs their degree in memory.
+
+        The incident edges are read whole before the first tombstone is written: a client serves one
+        query per session, so writing into an open block stream is refused mid-stream.
+        """
         keys = list(dict.fromkeys(nodes))
         if not keys:
             return
-        for page in batched(self.adjacent_edges(keys, Role.ANY), self.WRITE):
-            self.drop_edges(*zip(*(triple for _, triple in page), strict=True))
+        stored = [triple for _, triple in self.adjacent_edges(keys, Role.ANY)]
+        for page in batched(stored, self.WRITE):
+            self.drop_edges(*zip(*page, strict=True))
         version = self._version()
         self.client.insert(
             "nodes", [[int(key), version, 1] for key in keys], column_names=["node", "version", "is_deleted"]

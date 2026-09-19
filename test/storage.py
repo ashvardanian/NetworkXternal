@@ -69,6 +69,18 @@ def test_degrees_counts_a_hub_beyond_one_page(narrow):
     assert narrow.degrees([1], narrow.outgoing_role)[0] == len(pairs)
 
 
+def test_removing_a_hub_drops_every_incident_edge(narrow):
+    """A vertex of more degree than one write batch leaves nothing of itself behind."""
+    type(narrow).WRITE = PAGE
+    try:
+        star(narrow, 1, PAGE * 3 + 1)
+        narrow.remove_nodes_from([1])
+        assert not narrow.has_node(1)
+        assert all(1 not in (source, target) for source, target, _ in narrow.scan_edges())
+    finally:
+        del type(narrow).WRITE
+
+
 # endregion Paging
 
 

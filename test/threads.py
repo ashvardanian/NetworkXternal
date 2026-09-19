@@ -41,6 +41,29 @@ def test_concurrent_writers_keep_every_edge(empty):
     assert empty.number_of_edges() == THREADS * EDGES_PER_THREAD
 
 
+def claim_keyed(graph, thread: int) -> list[int]:
+    """Inserts one thread's keyed edges over a pair every thread shares, answering the keys it used."""
+    first = 10_000 + thread * EDGES_PER_THREAD
+    keys = list(range(first, first + EDGES_PER_THREAD))
+    graph.add_edges_from_arrays([1] * len(keys), [2] * len(keys), keys)
+    return keys
+
+
+def test_a_chosen_key_never_collides_with_an_allocated_one(empty):
+    """Threads choosing keys and threads letting the graph choose never land on the same identifier."""
+    if not type(empty).MULTIGRAPH:
+        pytest.skip("Only a multigraph takes edge keys")
+    if not type(empty).CONCURRENT:
+        pytest.skip(f"{type(empty).__name__} does not serve several threads from one instance")
+    with ThreadPoolExecutor(max_workers=THREADS) as pool:
+        chosen = [
+            key for outcome in [pool.submit(claim_keyed, empty, t) for t in range(THREADS)] for key in outcome.result()
+        ]
+    allocated = empty.add_edges_from_arrays([3] * THREADS, [4] * THREADS, [None] * THREADS)
+    assert set(allocated).isdisjoint(chosen)
+    assert len(set(allocated)) == THREADS
+
+
 def test_concurrent_readers_agree(populated):
     """Several threads reading one instance see the same graph."""
     if not type(populated).CONCURRENT:

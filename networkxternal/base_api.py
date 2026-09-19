@@ -405,6 +405,11 @@ class BaseGraph(ABC):
         """The edges between one pair, which is bounded by the multiplicity of that pair alone."""
         return [triple for _, triple in self.find_pairs([source], [target])]
 
+    def raise_edge_floor(self, floor: int) -> None:
+        """Keeps every identifier below `floor` out of the allocator, for a key the caller chose itself."""
+        with self.edge_ids_lock:
+            self.next_edge_id = max(self.next_edge_id or 0, floor)
+
     def allocate_edge_ids(self, count: int) -> list[int]:
         """Hands out identifiers past every one the graph already holds, to one thread at a time.
 
@@ -445,8 +450,7 @@ class BaseGraph(ABC):
         if self.MULTIGRAPH:
             fresh = iter(self.allocate_edge_ids(sum(key is None for key in wanted)))
             identifiers = [next(fresh) if key is None else key for key in wanted]
-            # A key the caller chose is never handed out again.
-            self.next_edge_id = max([self.next_edge_id or 0, *(key + 1 for key in wanted if key is not None)])
+            self.raise_edge_floor(max((key + 1 for key in wanted if key is not None), default=0))
             upserted = list(zip(sources, targets, identifiers, strict=True))
         else:
             stored = self.edges_of_pairs(sources, targets)
