@@ -11,7 +11,7 @@ import random
 from array import array
 from bisect import bisect_left
 from collections import Counter
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from heapq import heappop, heappush
@@ -455,6 +455,168 @@ def pagerank(
 
 # endregion PageRank
 
+# region Centrality
+
+
+def hits(
+    graph: BaseGraph,
+    iterations: int = 100,
+    tolerance: float = 1e-8,
+) -> tuple[dict[int, float], dict[int, float]]:
+    """The hub and authority score of every vertex, as `networkx.hits` answers them.
+
+    One sequential edge pass per sweep pushes hubs into authorities and authorities back into hubs,
+    so the two vectors are the only state the sweep carries.
+
+    Bound: 40 bytes per vertex across the four arrays, 92 per vertex in each answer, one pass per sweep.
+    """
+    order = DenseIndex(graph.scan_nodes())
+    count = len(order)
+    if not count:
+        return {}, {}
+    hubs = array("d", [1.0 / count]) * count
+    authorities = array("d", [1.0 / count]) * count
+    for _ in range(iterations):
+        pushed_authorities = array("d", [0.0]) * count
+        pushed_hubs = array("d", [0.0]) * count
+        for source, target, _ in scan_arcs(graph, None):
+            pushed_authorities[order[target]] += hubs[order[source]]
+        for source, target, _ in scan_arcs(graph, None):
+            pushed_hubs[order[source]] += pushed_authorities[order[target]]
+        authorities = normalized(pushed_authorities)
+        updated = normalized(pushed_hubs)
+        drift = sum(abs(one - other) for one, other in zip(updated, hubs, strict=True))
+        hubs = updated
+        if drift < count * tolerance:
+            break
+    return (
+        {node: hubs[index] for node, index in order.items()},
+        {node: authorities[index] for node, index in order.items()},
+    )
+
+
+def normalized(values: array) -> array:
+    """The values scaled to sum to one, or left alone where they sum to nothing."""
+    total = sum(values)
+    return array("d", [value / total for value in values]) if total else values
+
+
+def personalized_pagerank(
+    graph: BaseGraph,
+    preference: Mapping[int, float],
+    damping: float = 0.85,
+    iterations: int = 100,
+    tolerance: float = 1e-6,
+    weight: str | None = "weight",
+) -> dict[int, float]:
+    """PageRank where the mass that teleports lands on `preference` rather than everywhere equally.
+
+    Bound: 40 bytes per vertex across the four arrays, 92 per vertex in the answer, one pass per sweep.
+    """
+    order = DenseIndex(graph.scan_nodes())
+    count = len(order)
+    if not count:
+        return {}
+    total = sum(preference.values())
+    if not total:
+        raise ValueError("A preference vector must carry some mass")
+    landing = array("d", [0.0]) * count
+    for node, mass in preference.items():
+        landing[order[node]] = mass / total
+    ranks = array("d", landing)
+    scale = outgoing_scale(graph, order, weight)
+    dangling_at = [position for position, spread in enumerate(scale) if not spread]
+    for _ in range(iterations):
+        pushed = array("d", [0.0]) * count
+        for source, target, held in scan_arcs(graph, weight):
+            position = order[source]
+            pushed[order[target]] += ranks[position] * held * scale[position]
+        dangling = sum(map(ranks.__getitem__, dangling_at))
+        drift = 0.0
+        for index, mass in enumerate(pushed):
+            updated = damping * (mass + dangling * landing[index]) + (1.0 - damping) * landing[index]
+            drift += abs(updated - ranks[index])
+            ranks[index] = updated
+        if drift < count * tolerance:
+            break
+    return {node: ranks[index] for node, index in order.items()}
+
+
+def betweenness_centrality(
+    graph: BaseGraph,
+    sources: Iterable[int] | None = None,
+    seed: int | None = None,
+    samples: int | None = None,
+) -> dict[int, float]:
+    """How often each vertex lies on a shortest path, summed over `sources` or over a sample of them.
+
+    Brandes' accumulation without storing predecessors: the layered walk records a distance and a path
+    count per vertex, and the backward pass reads the adjacency again rather than holding it. So a
+    source costs two round trips per layer and no state proportional to the edges — and the sources
+    are independent of each other, which is where a parallel run would split.
+
+    Bound: 32 bytes per vertex across the distances, counts and dependencies, 92 per vertex in the
+    answer, two passes per layer per source.
+    """
+    order = DenseIndex(graph.scan_nodes())
+    count = len(order)
+    scores = array("d", [0.0]) * count
+    chosen = list(order) if sources is None else list(sources)
+    if samples is not None and samples < len(chosen):
+        chosen = reservoir(chosen, samples, seed)
+    for source in chosen:
+        layers, sigma, distance = shortest_path_counts(graph, order, source)
+        accumulate_dependencies(graph, order, layers, sigma, distance, scores)
+    halved = 1.0 if graph.is_directed() else 0.5
+    return {node: scores[index] * halved for node, index in order.items()}
+
+
+def shortest_path_counts(graph: BaseGraph, order: DenseIndex, source: int) -> tuple[list[list[int]], array, array]:
+    """The layers a walk from `source` reaches, how many shortest paths reach each vertex, and how far."""
+    count = len(order)
+    sigma = array("d", [0.0]) * count
+    distance = array("q", [-1]) * count
+    sigma[order[source]] = 1.0
+    distance[order[source]] = 0
+    layers = [[source]]
+    depth = 0
+    while layers[-1]:
+        beyond: list[int] = []
+        for node, other, _ in adjacency(graph, layers[-1], graph.outgoing_role):
+            position = order[other]
+            if distance[position] < 0:
+                distance[position] = depth + 1
+                beyond.append(other)
+            if distance[position] == depth + 1:
+                sigma[position] += sigma[order[node]]
+        layers.append(beyond)
+        depth += 1
+    layers.pop()
+    return layers, sigma, distance
+
+
+def accumulate_dependencies(
+    graph: BaseGraph,
+    order: DenseIndex,
+    layers: list[list[int]],
+    sigma: array,
+    distance: array,
+    scores: array,
+) -> None:
+    """Folds each layer's dependency back into the one before it, deepest first, adding to `scores`."""
+    dependency = array("d", [0.0]) * len(order)
+    for layer in reversed(layers[1:]):
+        for node, other, _ in adjacency(graph, layer, graph.outgoing_role):
+            here, there = order[node], order[other]
+            if distance[there] != distance[here] - 1 or not sigma[here]:
+                continue
+            dependency[there] += sigma[there] / sigma[here] * (1.0 + dependency[here])
+        for node in layer:
+            scores[order[node]] += dependency[order[node]]
+
+
+# endregion Centrality
+
 # region Peeling
 
 
@@ -617,6 +779,9 @@ BOUNDS = {
     "weakly_connected_components": Bounds(retained_per_vertex=68, working_per_vertex=24, passes="one"),
     "strongly_connected_components": Bounds(retained_per_vertex=68, working_per_vertex=32, passes="per round"),
     "topological_order": Bounds(retained_per_vertex=8, working_per_vertex=16, passes="per layer"),
+    "hits": Bounds(retained_per_vertex=184, working_per_vertex=40, passes="per sweep"),
+    "personalized_pagerank": Bounds(retained_per_vertex=92, working_per_vertex=40, passes="per sweep"),
+    "betweenness_centrality": Bounds(retained_per_vertex=92, working_per_vertex=32, passes="per layer"),
 }
 """What each algorithm holds and how often it reads the graph, which `test/bounds.py` measures.
 
