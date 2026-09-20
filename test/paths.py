@@ -5,7 +5,7 @@ from __future__ import annotations
 import networkx
 import pytest
 
-from networkxternal.algorithms import delta_stepping_lengths, dijkstra_lengths
+from algorithms import delta_stepping_lengths, dijkstra_lengths
 
 
 def undirected_only(populated):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import networkx
 import pytest
 
-from networkxternal.algorithms import (
+from algorithms import (
     strongly_connected_components,
     topological_order,
     weakly_connected_components,

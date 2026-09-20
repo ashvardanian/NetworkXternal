@@ -12,12 +12,12 @@ pip install "networkxternal[clickhouse]"
 
 ```python
 from networkxternal.clickhouse import ClickHouseGraph
-from networkxternal.algorithms import pagerank, triangle_counts
+from algorithms import PageRank, triangle_counts
 
 with ClickHouseGraph("clickhouse://graph:graph@localhost:8123/orkut") as graph:
     graph.add_weighted_edges_from([(1, 2, 0.5), (2, 3, 1.5)])
     print(graph.degree[2], list(graph.neighbors(2)))
-    print(pagerank(graph, iterations=20))
+    print(PageRank.on(graph, iterations=20).run())
 ```
 
 ## Supported Stores
@@ -51,19 +51,47 @@ All four NetworkX shapes come with each: `Graph`, `DiGraph`, `MultiGraph` and `M
 
 ## External-Memory Algorithms
 
-Vanilla NetworkX walks one vertex at a time, which costs a round-trip per step against a store, and pulls a whole neighbourhood to take one of them.
-The algorithms in `networkxternal.algorithms` stream edges instead: vertex state lives in arrays, edges arrive in stored order a page at a time, and one hub vertex no longer decides the footprint.
+Vanilla NetworkX walks one vertex at a time, which costs a round trip per step against a store, and pulls a whole neighbourhood to take one of them.
+The `algorithms` package drives the store instead: vertex state lives in `array` slots, edges arrive a page at a time, and one hub vertex no longer decides the footprint.
 
-| Function                       | What It Holds                                | What It Costs                                                                                          |
-| :----------------------------- | :------------------------------------------- | :----------------------------------------------------------------------------------------------------- |
-| `breadth_first_layers`         | The frontier and the visited set             | A round-trip per level, switching to a full edge scan once the frontier passes a tenth of the vertices |
-| `shortest_path_lengths`        | One depth per reached vertex                 | As above, one layer at a time                                                                          |
-| `connected_components`         | Three 8-byte slots per vertex                | One edge pass, union-find, no sweep that can fail to settle                                            |
-| `pagerank`                     | Three `array("d")` vectors and a dense index | One scatter pass per sweep, plus one weight pass in total                                              |
-| `core_numbers`                 | One degree per vertex, as `array("q")`       | One edge pass per peeling round, never a peeled vertex's neighbourhood                                 |
-| `triangle_counts`              | A CSR-style adjacency of the wanted vertices | Two edge passes to pack it, then sorted-run intersections through memoryviews                          |
-| `sample_nodes`, `sample_edges` | The reservoir                                | One pass, nothing else buffered                                                                        |
+Each algorithm is a class that declares what it holds, and a store says which way it would rather be walked.
+An edge-ordered store streams `scan_edges`; a relationship store and UStore index adjacency instead, so a page of vertices is their own unit.
 
+```python
+from algorithms import PageRank, Orientation
+
+PageRank.on(graph).run()                                 # the store picks the orientation
+PageRank.on(graph, orientation=Orientation.VERTEX).run() # or the caller does
+for held in PageRank.on(graph).sweeps():                 # watch it converge
+    print(held[42])
+pagerank(graph)                                          # the plain function, unchanged
+```
+
+An answer is a `VertexMap`, which reads as a `Mapping` over the arrays the walk already held — sixteen bytes a vertex against the eighty-four a `dict` costs, with `.to_dict()` when a caller wants one by name.
+
+| Algorithm                   | Orientation | Held per Vertex | Passes Over the Edges |
+| :-------------------------- | :---------- | :-------------- | :-------------------- |
+| BreadthFirstLayers          | vertex      | none            | per layer             |
+| ShortestPathLengths         | vertex      | 16 B            | per layer             |
+| NeighborsOfNeighbors        | vertex      | none            | per layer             |
+| DijkstraLengths             | vertex      | 16 B            | per settled vertex    |
+| DeltaSteppingLengths        | vertex      | 16 B            | per bucket            |
+| ConnectedComponents         | edge        | 16 B            | one                   |
+| StronglyConnectedComponents | vertex      | 16 B            | per round             |
+| TopologicalOrder            | vertex      | 8 B             | per layer             |
+| PageRank                    | either      | 16 B            | per sweep             |
+| PersonalizedPageRank        | either      | 16 B            | per sweep             |
+| HITS                        | either      | 24 B            | per sweep             |
+| BetweennessCentrality       | vertex      | 16 B            | per layer per source  |
+| CoreNumbers                 | edge        | 16 B            | per round             |
+| TriangleCounts              | edge        | 16 B            | two                   |
+| ClusteringCoefficients      | edge        | 16 B            | two                   |
+| LabelPropagation            | either      | 16 B            | per sweep             |
+| KTruss                      | edge        | 8 B per edge    | per round             |
+| DegreeHistogram             | vertex      | none            | one                   |
+| SampleNodes, SampleEdges    | either      | none            | one                   |
+
+A bound is declared on the class and measured by the suite, never trusted as prose.
 Everything else NetworkX ships still applies where the graph fits, and `__networkx_backend__` is declared for the dispatch protocol NetworkX 3.x uses.
 
 ## Benchmarks

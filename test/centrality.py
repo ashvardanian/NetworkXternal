@@ -5,7 +5,7 @@ from __future__ import annotations
 import networkx
 import pytest
 
-from networkxternal.algorithms import betweenness_centrality, hits, personalized_pagerank
+from algorithms import betweenness_centrality, hits, personalized_pagerank
 
 ARCS = [(1, 2), (2, 3), (3, 1), (3, 4), (4, 5), (6, 1)]
 """A directed graph with a cycle, a tail and a vertex pointing into it."""

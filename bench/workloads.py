@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from itertools import batched
 
+from algorithms import breadth_first_layers, neighbors_of_neighbors, pagerank
 from bench.limits import Budget
-from networkxternal.algorithms import breadth_first_layers, neighbors_of_neighbors, pagerank
 from networkxternal.base_api import BaseGraph
 
 type Sample = Sequence[tuple[int, int, float | None]]

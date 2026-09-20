@@ -5,7 +5,7 @@ from __future__ import annotations
 import networkx
 import pytest
 
-from networkxternal.algorithms import clustering_coefficients, k_truss, label_propagation
+from algorithms import clustering_coefficients, k_truss, label_propagation
 
 CLIQUES = [(1, 2), (2, 3), (3, 1), (3, 4), (4, 5), (5, 3), (6, 7), (7, 8), (8, 6)]
 """Two triangles joined through one vertex, and a third triangle apart from both."""

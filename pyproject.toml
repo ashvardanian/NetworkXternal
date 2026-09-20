@@ -67,11 +67,14 @@ lint = ["ruff>=0.16"]
 # NumPy and SciPy back the NetworkX algorithms the semi-external ones are compared against.
 test = ["networkx>=3.6", "numpy>=2.5", "pytest>=9", "scipy>=1.16", "sqlalchemy-utils>=0.42", "sqlalchemy>=2.0.54"]
 
+# The algorithms are a layer over the storage verbs rather than part of them, so they ship as their
+# own top-level package.
 [tool.hatch.build.targets.wheel]
-packages = ["networkxternal"]
+packages = ["algorithms", "networkxternal"]
 
 [tool.pytest.ini_options]
-addopts = ["-ra", "--showlocals", "--strict-config", "--strict-markers"]
+# `importlib` keeps `test/` off `sys.path`, so `test/algorithms.py` cannot shadow the package it tests.
+addopts = ["-ra", "--import-mode=importlib", "--showlocals", "--strict-config", "--strict-markers"]
 filterwarnings = ["error"]
 markers = [
   "server: needs a database server, started from benchmarks/docker-compose.yml",
@@ -89,4 +92,4 @@ target-version = "py312"
 select = ["B", "C90", "E", "F", "I", "SIM", "UP", "W"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["networkxternal"]
+known-first-party = ["algorithms", "networkxternal"]

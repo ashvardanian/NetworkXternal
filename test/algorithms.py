@@ -5,7 +5,7 @@ from __future__ import annotations
 import networkx
 import pytest
 
-from networkxternal.algorithms import (
+from algorithms import (
     breadth_first_layers,
     connected_components,
     core_numbers,
