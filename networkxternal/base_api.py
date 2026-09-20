@@ -65,6 +65,16 @@ class Role(StrEnum):
     ANY = "any"
 
 
+class Orientation(StrEnum):
+    """What a store is ordered by, which decides whether a pass should drive edges or vertices."""
+
+    EDGE = "edge"
+    """Edges are a sequence the engine streams: SQL over the composite index, ClickHouse parts, MongoDB."""
+
+    VERTEX = "vertex"
+    """Adjacency is the unit and an edge scan is synthesized from it: UStore, and Cypher without an edge index."""
+
+
 class AttributeStore(StrEnum):
     """Which of the two attribute stores a document read or write addresses."""
 
@@ -251,6 +261,9 @@ class BaseGraph(ABC):
 
     CONCURRENT: ClassVar[bool] = True
     """Whether one instance serves several threads, which a free-threaded interpreter exploits."""
+
+    SCAN_ORIENTATION: ClassVar[Orientation] = Orientation.EDGE
+    """Which way this store would rather be walked, which is how an algorithm picks its variant."""
 
     __networkx_backend__: ClassVar[str] = "networkxternal"
     """The name NetworkX dispatches by, so `nx.pagerank(graph, backend="networkxternal")` finds this graph."""
@@ -468,6 +481,11 @@ class BaseGraph(ABC):
     def outgoing_role(self) -> Role:
         """The role a vertex plays in the edges it reaches its neighbours by."""
         return Role.SOURCE if self.DIRECTED else Role.ANY
+
+    @property
+    def incoming_role(self) -> Role:
+        """The role a vertex plays in the edges that reach it."""
+        return Role.TARGET if self.DIRECTED else Role.ANY
 
     def canonical_pair(self, source: int, target: int) -> tuple[int, int]:
         """The pair both orientations of an undirected edge share."""

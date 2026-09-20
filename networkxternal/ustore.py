@@ -32,6 +32,7 @@ from networkxternal.base_api import (
     BaseMultiGraph,
     Cursor,
     NetworkXternalError,
+    Orientation,
     Role,
     Triple,
 )
@@ -60,6 +61,9 @@ class UStoreGraph(BaseGraph):
 
     PAGE = 1 << 16
     """UStore takes whole batches in one call, so a page is as large as the engine's own."""
+
+    SCAN_ORIENTATION = Orientation.VERTEX
+    """The graph modality indexes adjacency, so an edge-ordered scan is synthesized one vertex at a time."""
 
     def __init__(
         self,

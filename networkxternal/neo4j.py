@@ -29,6 +29,7 @@ from networkxternal.base_api import (
     BaseMultiGraph,
     Cursor,
     NetworkXternalError,
+    Orientation,
     Role,
     Triple,
     path_head,
@@ -148,6 +149,9 @@ class Neo4JGraph(BaseGraph):
     """An undirected simple graph stored in Neo4J, as `networkx.Graph` is in RAM."""
 
     PAGE = BATCH
+
+    SCAN_ORIENTATION = Orientation.VERTEX
+    """A relationship store reaches an edge from either of its ends, which is what adjacency already is."""
 
     def __init__(self, url: str = "bolt://localhost:7687/graph") -> None:
         super().__init__()
