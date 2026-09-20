@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
 from enum import StrEnum
 from itertools import batched, islice, repeat
 from operator import itemgetter
@@ -72,11 +72,47 @@ class AttributeStore(StrEnum):
     EDGES = "edges"
 
 
-class NodeView:
-    """The vertices of a graph: iterable, sized, and callable for their attributes, as `Graph.nodes` is."""
+class AdjacencyView(Mapping[int, dict[int, Any]]):
+    """The neighbours of every vertex, resolved on lookup rather than held, as NetworkX means by a view.
+
+    A lookup costs the degree of that vertex, an iteration costs a vertex scan, and the whole graph is
+    never in memory at once — which is the difference between this and the dict it replaces.
+    """
+
+    def __init__(self, graph: BaseGraph, role: Role) -> None:
+        self.graph = graph
+        self.role = role
+
+    def __getitem__(self, node: int) -> dict[int, Any]:
+        if self.role is Role.TARGET:
+            if not self.graph.has_node(node):
+                raise KeyError(node)
+            return dict.fromkeys(self.graph.predecessors(node), EMPTY_DOCUMENT)
+        return self.graph[node]
+
+    def __iter__(self) -> Iterator[int]:
+        return self.graph.scan_nodes()
+
+    def __len__(self) -> int:
+        return self.graph.count_nodes()
+
+    def __contains__(self, node: object) -> bool:
+        return isinstance(node, int) and self.graph.has_node(node)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({len(self)} vertices)"
+
+
+class NodeView(Set[int]):
+    """The vertices of a graph: a set, and callable for their attributes, as `Graph.nodes` is."""
 
     def __init__(self, graph: BaseGraph) -> None:
         self.graph = graph
+
+    @classmethod
+    def _from_iterable(cls, items: Iterable[int]) -> set[int]:
+        """A set operation answers with a plain set, since a view is bound to its graph."""
+        return set(items)
 
     def __iter__(self) -> Iterator[int]:
         return iter(self.graph)
@@ -104,11 +140,16 @@ class NodeView:
                 yield (node, found) if data is True else (node, found.get(data, default))
 
 
-class EdgeView:
-    """The edges of a graph: iterable, sized, and callable for keys and attributes, as `Graph.edges` is."""
+class EdgeView(Set[tuple[int, ...]]):
+    """The edges of a graph: a set, and callable for keys and attributes, as `Graph.edges` is."""
 
     def __init__(self, graph: BaseGraph) -> None:
         self.graph = graph
+
+    @classmethod
+    def _from_iterable(cls, items: Iterable[tuple[int, ...]]) -> set[tuple[int, ...]]:
+        """A set operation answers with a plain set, since a view is bound to its graph."""
+        return set(items)
 
     def __iter__(self) -> Iterator[tuple[int, ...]]:
         """Every edge as its two ends, followed by its key in a multigraph."""
@@ -700,9 +741,9 @@ class BaseGraph(ABC):
         return (node for node in nodes if self.has_node(node))
 
     @property
-    def adj(self) -> dict[int, Any]:
-        """A snapshot of the adjacency of every vertex; writing into it does not reach the store."""
-        return {node: self[node] for node in self}
+    def adj(self) -> AdjacencyView:
+        """The neighbours of every vertex, resolved per lookup; writing into it does not reach the store."""
+        return AdjacencyView(self, self.outgoing_role)
 
     def adjacency(self) -> Iterator[tuple[int, dict[int, Any]]]:
         """Yields every vertex with the attributes of the edges reaching its neighbours, page by page."""
@@ -816,14 +857,14 @@ class BaseDiGraph(BaseGraph):
         return self.has_edge(target, source)
 
     @property
-    def succ(self) -> dict[int, Any]:
-        """A snapshot of every vertex's successors; writing into it does not reach the store."""
+    def succ(self) -> AdjacencyView:
+        """The successors of every vertex, resolved per lookup."""
         return self.adj
 
     @property
-    def pred(self) -> dict[int, Any]:
-        """A snapshot of every vertex's predecessors; writing into it does not reach the store."""
-        return {node: {source: {} for source in self.predecessors(node)} for node in self}
+    def pred(self) -> AdjacencyView:
+        """The predecessors of every vertex, resolved per lookup."""
+        return AdjacencyView(self, Role.TARGET)
 
     def predecessors(self, node: int) -> Iterator[int]:
         return iter(sorted({source for _, (source, _, _) in self.adjacent_edges([node], Role.TARGET)}))
