@@ -29,7 +29,6 @@ Release:*)
     else
         stale=""
         [ "$(git show :VERSION 2>/dev/null)" = "$version" ] || stale="$stale VERSION"
-        git show :CITATION.cff 2>/dev/null | grep -qxF "version: $version" || stale="$stale CITATION.cff"
         git show :pyproject.toml 2>/dev/null | grep -qxF "version = \"$version\"" || stale="$stale pyproject.toml"
         git show :uv.lock 2>/dev/null | grep -A1 -xF 'name = "networkxternal"' | grep -qxF "version = \"$version\"" || stale="$stale uv.lock"
         git show :networkxternal/__init__.py 2>/dev/null | grep -qxF "__version__ = \"$version\"" || stale="$stale networkxternal/__init__.py"

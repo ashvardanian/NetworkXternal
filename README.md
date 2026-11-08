@@ -1,6 +1,6 @@
 # NetworkXternal
 
-![NetworkXternal thumbnail](https://github.com/ashvardanian/ashvardanian/raw/master/repositories/NetworkXternal.jpg?raw=true)
+![NetworkXternal banner](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/NetworkXternal.jpg?raw=true)
 
 NetworkXternal gives [NetworkX](https://github.com/networkx/networkx)-shaped graphs a home outside of RAM.
 The same `nodes`, `edges`, `degree` and `neighbors` you already write against, served by UStore, ClickHouse, MongoDB, PostgreSQL, SQLite, MySQL, Neo4J or Memgraph, so a graph grows from Gigabytes to Terabytes without your code noticing.

@@ -10,7 +10,6 @@ previous=$(git describe --tags --abbrev=0)
 git diff --quiet HEAD || { echo "mint-release: commit or stash your changes first"; exit 1; }
 
 echo "$version" > VERSION
-perl -pi -e 's/^version: \S+$/version: $ENV{version}/' CITATION.cff
 perl -pi -e 's/^version = "[^"]+"$/version = "$ENV{version}"/' pyproject.toml
 perl -0pi -e 's/^(name = "networkxternal"\nversion = ")[^"]+"$/$1$ENV{version}"/m' uv.lock
 perl -pi -e 's/^__version__ = "[^"]+"$/__version__ = "$ENV{version}"/' networkxternal/__init__.py

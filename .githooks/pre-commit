@@ -12,6 +12,12 @@
 set -u
 LC_ALL=C
 
+# CITATION.cff cites the concept DOI, which spans every release, so it never carries a version.
+if git show :CITATION.cff 2> /dev/null | grep -q '^version:'; then
+    echo "pre-commit: CITATION.cff carries no version; the concept DOI spans every release." >&2
+    exit 1
+fi
+
 failed=0
 
 # Prints the reason and the first offending lines, and marks the commit rejected.
